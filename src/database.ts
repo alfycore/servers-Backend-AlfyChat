@@ -20,8 +20,12 @@ export function initDatabase(config: {
     password: config.password,
     database: config.database,
     waitForConnections: true,
-    connectionLimit: 10,
-    queueLimit: 0
+    connectionLimit: 30,
+    queueLimit: 0,
+    enableKeepAlive: true,
+    keepAliveInitialDelay: 0,
+    connectTimeout: 10000,
+    idleTimeout: 60000,
   });
   return pool;
 }
