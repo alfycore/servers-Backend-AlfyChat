@@ -4,13 +4,14 @@
 // Le système central gère uniquement l'annuaire et les métadonnées
 // ==========================================
 
-import express, { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import dotenv from 'dotenv';
 import { Router } from 'express';
 import { body, validationResult } from 'express-validator';
 import { v4 as uuidv4 } from 'uuid';
+import jwt from 'jsonwebtoken';
 import mysql, { Pool, ResultSetHeader, RowDataPacket, PoolConnection } from 'mysql2/promise';
 import Redis from 'ioredis';
 import winston from 'winston';
@@ -20,7 +21,39 @@ import fs from 'fs';
 
 dotenv.config();
 
-// Interfaces pour les paramètres de routes
+// ==========================================
+// JWT AUTH MIDDLEWARE
+// ==========================================
+
+interface AuthRequest extends Request {
+  userId?: string;
+}
+
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) throw new Error('JWT_SECRET environment variable is required');
+
+function authMiddleware(req: AuthRequest, res: Response, next: NextFunction): void {
+  // Trust x-user-id set by the gateway (internal network) OR verify Bearer JWT
+  const xUserId = req.headers['x-user-id'] as string | undefined;
+  if (xUserId) {
+    req.userId = xUserId;
+    return next();
+  }
+
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) {
+    res.status(401).json({ error: 'Authentification requise' });
+    return;
+  }
+  try {
+    const token = authHeader.slice(7);
+    const decoded = jwt.verify(token, JWT_SECRET!) as { userId: string };
+    req.userId = decoded.userId;
+    next();
+  } catch {
+    res.status(401).json({ error: 'Token invalide' });
+  }
+}
 interface ServerIdParams {
   serverId: string;
 }
@@ -31,7 +64,17 @@ interface ServerChannelParams {
 }
 
 const app = express();
-app.use(cors());
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || process.env.FRONTEND_URL || 'http://localhost:4000')
+  .split(',').map((o) => o.trim());
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true);
+    if (/^http:\/\/localhost(:\d+)?$/.test(origin)) return cb(null, true);
+    if (allowedOrigins.includes(origin)) return cb(null, true);
+    cb(new Error(`CORS: origine non autorisée — ${origin}`));
+  },
+  credentials: true,
+}));
 app.use(helmet());
 app.use(express.json());
 
@@ -89,19 +132,20 @@ const serversRouter = Router();
 // ============ ENREGISTREMENT D'UN SERVEUR HÉBERGÉ ============
 
 serversRouter.post('/register',
+  authMiddleware,
   body('name').isLength({ min: 2, max: 100 }),
-  body('ownerId').isUUID(),
   body('endpoint').notEmpty(),
   body('port').isInt({ min: 1, max: 65535 }),
   body('publicKey').notEmpty(),
-  async (req, res) => {
+  async (req: AuthRequest, res) => {
     try {
       const errors = validationResult(req);
       if (!errors.isEmpty()) {
         return res.status(400).json({ errors: errors.array() });
       }
 
-      const { name, description, ownerId, endpoint, port, publicKey, maxMembers = 100 } = req.body;
+      const { name, description, endpoint, port, publicKey, maxMembers = 100 } = req.body;
+      const ownerId = req.userId!;
       const db = getDb();
       const serverId = uuidv4();
       const defaultRoleId = uuidv4();
@@ -165,7 +209,7 @@ serversRouter.post('/register',
 
 // ============ HEARTBEAT DU SERVEUR HÉBERGÉ ============
 
-serversRouter.post('/:serverId/ping', async (req, res) => {
+serversRouter.post('/:serverId/ping', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const { serverId } = req.params;
     const { stats } = req.body; // Optionnel: stats du serveur (CPU, RAM, utilisateurs connectés)
@@ -191,13 +235,9 @@ serversRouter.post('/:serverId/ping', async (req, res) => {
 
 // ============ RÉCUPÉRER LES SERVEURS D'UN UTILISATEUR ============
 
-serversRouter.get('/', async (req, res) => {
+serversRouter.get('/', authMiddleware, async (req: AuthRequest, res) => {
   try {
-    const userId = (req.query.userId as string) || (req.headers['x-user-id'] as string);
-    
-    if (!userId) {
-      return res.status(400).json({ error: 'UserId requis' });
-    }
+    const userId = req.userId!;
     
     const db = getDb();
 
@@ -342,11 +382,12 @@ serversRouter.get('/:serverId', async (req, res) => {
 // ============ REJOINDRE UN SERVEUR ============
 
 serversRouter.post<ServerIdParams>('/:serverId/join',
-  body('userId').isUUID(),
-  async (req, res) => {
+  authMiddleware,
+  async (req: AuthRequest, res) => {
     try {
       const { serverId } = req.params;
-      const { userId, inviteCode } = req.body;
+      const userId = req.userId!;
+      const { inviteCode } = req.body;
       const db = getDb();
 
       // Vérifier que le serveur existe
@@ -409,11 +450,11 @@ serversRouter.post<ServerIdParams>('/:serverId/join',
 // ============ QUITTER UN SERVEUR ============
 
 serversRouter.post<ServerIdParams>('/:serverId/leave',
-  body('userId').isUUID(),
-  async (req, res) => {
+  authMiddleware,
+  async (req: AuthRequest, res) => {
     try {
       const { serverId } = req.params;
-      const { userId } = req.body;
+      const userId = req.userId!;
       const db = getDb();
 
       // Vérifier que l'utilisateur n'est pas le propriétaire
@@ -470,6 +511,7 @@ serversRouter.get<ServerIdParams>('/:serverId/channels', async (req, res) => {
 });
 
 serversRouter.post<ServerIdParams>('/:serverId/channels',
+  authMiddleware,
   body('name').isLength({ min: 1, max: 100 }),
   body('type').isIn(['text', 'voice', 'announcement', 'category', 'forum', 'stage', 'gallery', 'poll', 'suggestion', 'doc', 'counting', 'vent', 'thread', 'media']),
   async (req, res) => {
@@ -521,7 +563,7 @@ serversRouter.post<ServerIdParams>('/:serverId/channels',
   }
 );
 
-serversRouter.patch('/:serverId/channels/:channelId', async (req, res) => {
+serversRouter.patch('/:serverId/channels/:channelId', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const { channelId } = req.params;
     const { name, topic, position, isNsfw, slowMode, parentId } = req.body;
@@ -549,7 +591,7 @@ serversRouter.patch('/:serverId/channels/:channelId', async (req, res) => {
   }
 });
 
-serversRouter.delete('/:serverId/channels/:channelId', async (req, res) => {
+serversRouter.delete('/:serverId/channels/:channelId', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const { channelId } = req.params;
     const db = getDb();
@@ -566,6 +608,7 @@ serversRouter.delete('/:serverId/channels/:channelId', async (req, res) => {
 // ============ GÉRER LES RÔLES ============
 
 serversRouter.post<ServerIdParams>('/:serverId/roles',
+  authMiddleware,
   body('name').isLength({ min: 1, max: 100 }),
   async (req, res) => {
     try {
@@ -597,14 +640,15 @@ serversRouter.post<ServerIdParams>('/:serverId/roles',
 // ============ CRÉER UN SERVEUR (interface frontend — sans endpoint requis) ============
 
 serversRouter.post('/',
+  authMiddleware,
   body('name').isLength({ min: 2, max: 100 }),
-  body('ownerId').isUUID(),
-  async (req, res) => {
+  async (req: AuthRequest, res) => {
     try {
       const errors = validationResult(req);
       if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
-      const { name, description, ownerId, iconUrl, bannerUrl, isPublic = false } = req.body;
+      const { name, description, iconUrl, bannerUrl, isPublic = false } = req.body;
+      const ownerId = req.userId!;
       const db = getDb();
       const serverId = uuidv4();
       const nodeToken = uuidv4();
@@ -662,7 +706,7 @@ serversRouter.post('/',
 
 // ============ METTRE À JOUR UN SERVEUR ============
 
-serversRouter.patch<ServerIdParams>('/:serverId', async (req, res) => {
+serversRouter.patch<ServerIdParams>('/:serverId', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const { serverId } = req.params;
     const { name, description, iconUrl, bannerUrl, isPublic } = req.body;
@@ -691,7 +735,7 @@ serversRouter.patch<ServerIdParams>('/:serverId', async (req, res) => {
 
 // ============ SUPPRIMER UN SERVEUR ============
 
-serversRouter.delete<ServerIdParams>('/:serverId', async (req, res) => {
+serversRouter.delete<ServerIdParams>('/:serverId', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const { serverId } = req.params;
     const db = getDb();
@@ -766,7 +810,7 @@ serversRouter.get<ServerIdParams>('/:serverId/members', async (req, res) => {
 });
 
 // Mise à jour d'un membre (rôles, nickname)
-serversRouter.patch('/:serverId/members/:userId', async (req, res) => {
+serversRouter.patch('/:serverId/members/:userId', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const { serverId, userId } = req.params;
     const { roleIds, nickname } = req.body;
