@@ -13,6 +13,7 @@ import { body, validationResult } from 'express-validator';
 import { v4 as uuidv4 } from 'uuid';
 import jwt from 'jsonwebtoken';
 import mysql, { Pool, ResultSetHeader, RowDataPacket, PoolConnection } from 'mysql2/promise';
+import { startServiceRegistration, serviceMetricsMiddleware } from './utils/service-client';
 import Redis from 'ioredis';
 import winston from 'winston';
 import multer from 'multer';
@@ -77,6 +78,7 @@ app.use(cors({
 }));
 app.use(helmet());
 app.use(express.json());
+app.use(serviceMetricsMiddleware);
 
 const logger = winston.createLogger({
   level: 'info',
@@ -2128,6 +2130,7 @@ async function start() {
     const PORT = process.env.PORT || 3005;
     app.listen(PORT, () => {
       logger.info(`🚀 Service Servers démarré sur le port ${PORT}`);
+      startServiceRegistration('servers');
     });
   } catch (error) {
     logger.error('Erreur au démarrage:', error);
