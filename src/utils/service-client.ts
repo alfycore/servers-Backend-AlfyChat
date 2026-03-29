@@ -9,6 +9,7 @@
 // ==========================================
 
 import os from 'os';
+import v8 from 'v8';
 
 type ServiceType = 'users' | 'messages' | 'friends' | 'calls' | 'servers' | 'bots' | 'media';
 
@@ -34,18 +35,19 @@ export function collectServiceMetrics() {
   _bytesOut = _bytesOut.filter((e) => e.ts >= cutoff);
 
   const mem = process.memoryUsage();
+  const heapLimit = v8.getHeapStatistics().heap_size_limit;
   const cpus = os.cpus();
   let idle = 0, total = 0;
   for (const c of cpus) {
-    for (const v of Object.values(c.times)) total += v;
+    for (const val of Object.values(c.times)) total += val;
     idle += c.times.idle;
   }
   const cpuUsage = total > 0 ? Math.round((1 - idle / total) * 100) : 0;
   const totalBytes = _bytesOut.reduce((s, e) => s + e.bytes, 0);
 
   return {
-    ramUsage: mem.rss,
-    ramMax: os.totalmem(),
+    ramUsage: mem.heapUsed,
+    ramMax: heapLimit,
     cpuUsage,
     cpuMax: 100,
     bandwidthUsage: Math.round(totalBytes / (WINDOW_MS / 1000)),
