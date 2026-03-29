@@ -13,7 +13,7 @@ import { body, validationResult } from 'express-validator';
 import { v4 as uuidv4 } from 'uuid';
 import jwt from 'jsonwebtoken';
 import mysql, { Pool, ResultSetHeader, RowDataPacket, PoolConnection } from 'mysql2/promise';
-import { startServiceRegistration, serviceMetricsMiddleware } from './utils/service-client';
+import { startServiceRegistration, serviceMetricsMiddleware, collectServiceMetrics } from './utils/service-client';
 import Redis from 'ioredis';
 import winston from 'winston';
 import multer from 'multer';
@@ -1910,6 +1910,16 @@ app.get('/servers/:serverId/files/:filename', (req: Request, res: Response) => {
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'servers' });
+});
+
+app.get('/metrics', (req, res) => {
+  res.json({
+    service: 'servers',
+    serviceId: process.env.SERVICE_ID || 'servers-default',
+    location: (process.env.SERVICE_LOCATION || 'EU').toUpperCase(),
+    ...collectServiceMetrics(),
+    uptime: process.uptime(),
+  });
 });
 
 async function start() {
