@@ -261,7 +261,8 @@ serversRouter.get('/', authMiddleware, async (req: AuthRequest, res) => {
 
         // Vérifier le statut en ligne dans Redis
         const hostInfo = await redis.hget('servers:registry', server.id);
-        const isOnline = hostInfo ? JSON.parse(hostInfo).isOnline : false;
+        let isOnline = false;
+        try { if (hostInfo) isOnline = JSON.parse(hostInfo).isOnline ?? false; } catch { /* donnée corrompue */ }
 
         return {
           id: server.id,
@@ -373,7 +374,7 @@ serversRouter.get('/:serverId', async (req, res) => {
         status: m.status,
         isOnline: m.is_online,
       })),
-      hostInfo: hostInfo ? JSON.parse(hostInfo) : null,
+      hostInfo: hostInfo ? (() => { try { return JSON.parse(hostInfo); } catch { return null; } })() : null,
     });
   } catch (error) {
     logger.error('Erreur récupération serveur:', error);
@@ -1635,9 +1636,11 @@ serversRouter.get('/public/list', async (req, res) => {
     const result = await Promise.all(
       (servers as any[]).map(async (server) => {
         const hostInfo = await redis.hget('servers:registry', server.id);
+        let isOnline = false;
+        try { if (hostInfo) isOnline = JSON.parse(hostInfo).isOnline ?? false; } catch { /* donnée corrompue */ }
         return {
           ...server,
-          isOnline: hostInfo ? JSON.parse(hostInfo).isOnline : false,
+          isOnline,
         };
       })
     );
@@ -1865,9 +1868,11 @@ async function cleanupOfflineServers() {
     
     const hostInfo = await redis.hget('servers:registry', serverId);
     if (hostInfo) {
-      const parsed = JSON.parse(hostInfo);
-      parsed.isOnline = false;
-      await redis.hset('servers:registry', serverId, JSON.stringify(parsed));
+      try {
+        const parsed = JSON.parse(hostInfo);
+        parsed.isOnline = false;
+        await redis.hset('servers:registry', serverId, JSON.stringify(parsed));
+      } catch { /* donnée corrompue — on ignore */ }
     }
     
     await redis.zrem('servers:online', serverId);

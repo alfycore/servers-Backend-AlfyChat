@@ -61,7 +61,7 @@ export function collectServiceMetrics() {
  */
 export function startServiceRegistration(serviceType: ServiceType): void {
   const GATEWAY_URL     = process.env.GATEWAY_URL     || 'http://localhost:3000';
-  const INTERNAL_SECRET = process.env.INTERNAL_SECRET || 'alfychat-internal-secret-dev';
+  const SERVICE_KEY = process.env.SERVICE_KEY || '';
   const SERVICE_ID      = process.env.SERVICE_ID      || `${serviceType}-default`;
   const SERVICE_LOCATION = (process.env.SERVICE_LOCATION || 'EU').toUpperCase();
   const PORT            = process.env.PORT            || '3000';
@@ -74,7 +74,7 @@ export function startServiceRegistration(serviceType: ServiceType): void {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          secret: INTERNAL_SECRET,
+          secret: SERVICE_KEY,
           id: SERVICE_ID,
           serviceType,
           endpoint: SERVICE_ENDPOINT,
@@ -99,7 +99,7 @@ export function startServiceRegistration(serviceType: ServiceType): void {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          secret: INTERNAL_SECRET,
+          secret: SERVICE_KEY,
           id: SERVICE_ID,
           metrics: collectServiceMetrics(),
         }),
