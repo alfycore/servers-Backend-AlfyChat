@@ -2498,6 +2498,45 @@ async function cleanupOfflineServers() {
   }
 }
 
+// ── Nettoyage des serveurs-nodes abandonnés ────────────────────────────────
+// Un serveur self-hosted sans aucun membre depuis 10 jours est automatiquement
+// désenregistré (supprimé de la DB). Le node peut se ré-enregistrer à tout moment.
+async function cleanupAbandonedNodeServers() {
+  try {
+    const TEN_DAYS_MS = 10 * 24 * 60 * 60 * 1000;
+    const cutoff = new Date(Date.now() - TEN_DAYS_MS).toISOString().slice(0, 19).replace('T', ' ');
+
+    // Trouver les serveurs node (node_token non null) sans aucun membre
+    // depuis plus de 10 jours (on se base sur created_at si la table est vide)
+    const [abandoned] = await pool.query(
+      `SELECT s.id, s.name
+       FROM servers s
+       WHERE s.node_token IS NOT NULL
+         AND s.created_at < ?
+         AND NOT EXISTS (
+           SELECT 1 FROM server_members sm WHERE sm.server_id = s.id
+         )`,
+      [cutoff]
+    );
+
+    for (const server of abandoned as any[]) {
+      // Supprimer dans l'ordre (FK constraints)
+      await pool.execute('DELETE FROM server_invites WHERE server_id = ?', [server.id]);
+      await pool.execute('DELETE FROM channels WHERE server_id = ?', [server.id]);
+      await pool.execute('DELETE FROM roles WHERE server_id = ?', [server.id]);
+      await pool.execute('DELETE FROM servers WHERE id = ?', [server.id]);
+
+      // Nettoyer Redis
+      await redis.zrem('servers:online', server.id);
+      await redis.hdel('servers:registry', server.id);
+
+      logger.info(`🗑️  Serveur node abandonné supprimé: ${server.name} (${server.id})`);
+    }
+  } catch (err: any) {
+    logger.error('Erreur cleanupAbandonedNodeServers:', err?.message);
+  }
+}
+
 app.use('/servers', serversRouter);
 
 // ── Upload de fichiers (fallback sans server-node) ─────────────────────────
@@ -2859,6 +2898,9 @@ async function start() {
 
     // Lancer le nettoyage périodique
     setInterval(cleanupOfflineServers, 30000);
+    // Nettoyage quotidien des serveurs-nodes sans membres depuis 10 jours
+    setInterval(cleanupAbandonedNodeServers, 24 * 60 * 60 * 1000);
+    cleanupAbandonedNodeServers(); // Passer une première fois au démarrage
 
     const PORT = process.env.PORT || 3005;
     app.listen(PORT, () => {
