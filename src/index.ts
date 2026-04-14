@@ -19,6 +19,7 @@ import winston from 'winston';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 
 dotenv.config();
 
@@ -34,6 +35,15 @@ const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) throw new Error('JWT_SECRET environment variable is required');
 
 function authMiddleware(req: AuthRequest, res: Response, next: NextFunction): void {
+  // Bypass interne : requêtes du gateway avec x-internal-secret
+  const internalSecret = req.headers['x-internal-secret'] as string | undefined;
+  const internalEnv = process.env.INTERNAL_SECRET;
+  if (internalEnv && internalSecret && internalSecret === internalEnv) {
+    const xUserId = req.headers['x-user-id'] as string | undefined;
+    req.userId = xUserId ?? 'internal';
+    return next();
+  }
+
   // Trust x-user-id set by the gateway (internal network) OR verify Bearer JWT
   const xUserId = req.headers['x-user-id'] as string | undefined;
   if (xUserId) {
@@ -55,6 +65,22 @@ function authMiddleware(req: AuthRequest, res: Response, next: NextFunction): vo
     res.status(401).json({ error: 'Token invalide' });
   }
 }
+
+async function adminMiddleware(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
+  const userId = req.userId;
+  if (!userId) { res.status(401).json({ error: 'Authentification requise' }); return; }
+  try {
+    const db = getDb();
+    const [rows] = await db.query<RowDataPacket[]>('SELECT role FROM users WHERE id = ?', [userId]);
+    if (!(rows as any[]).length || !['admin', 'moderator'].includes((rows as any[])[0].role)) {
+      res.status(403).json({ error: 'Accès réservé aux administrateurs' }); return;
+    }
+    next();
+  } catch {
+    res.status(500).json({ error: 'Erreur vérification rôle' });
+  }
+}
+
 interface ServerIdParams {
   serverId: string;
 }
@@ -872,7 +898,7 @@ serversRouter.get<ServerIdParams>('/:serverId/roles', async (req, res) => {
   }
 });
 
-serversRouter.patch('/:serverId/roles/:roleId', async (req, res) => {
+serversRouter.patch('/:serverId/roles/:roleId', authMiddleware, async (req, res) => {
   try {
     const { roleId } = req.params;
     const { name, color, permissions, iconEmoji, iconUrl, position } = req.body;
@@ -900,7 +926,7 @@ serversRouter.patch('/:serverId/roles/:roleId', async (req, res) => {
   }
 });
 
-serversRouter.delete('/:serverId/roles/:roleId', async (req, res) => {
+serversRouter.delete('/:serverId/roles/:roleId', authMiddleware, async (req, res) => {
   try {
     const { roleId } = req.params;
     const db = getDb();
@@ -940,7 +966,8 @@ serversRouter.post<ServerIdParams>('/:serverId/invites', async (req, res) => {
     let code: string = req.body.code || '';
     if (!code) {
       const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
-      for (let i = 0; i < 8; i++) code += chars[Math.floor(Math.random() * chars.length)];
+      const randBytes = crypto.randomBytes(8);
+      for (let i = 0; i < 8; i++) code += chars[randBytes[i] % chars.length];
     }
 
     // Si le code existe déjà en base, retourner l'existant (idempotent pour la sync node)
@@ -991,7 +1018,7 @@ serversRouter.get<ServerIdParams>('/:serverId/invites', async (req, res) => {
   }
 });
 
-serversRouter.delete('/invites/:inviteId', async (req, res) => {
+serversRouter.delete('/invites/:inviteId', authMiddleware, async (req, res) => {
   try {
     const { inviteId } = req.params;
     const db = getDb();
@@ -1455,7 +1482,7 @@ serversRouter.post('/nodes/register', async (req, res) => {
     const defaultRoleId = uuidv4();
     const generalChannelId = uuidv4();
     const voiceChannelId = uuidv4();
-    const inviteCode = Math.random().toString(36).substring(2, 10).toUpperCase();
+    const inviteCode = crypto.randomBytes(4).toString('hex').toUpperCase();
 
     await db.transaction(async (conn) => {
       await conn.execute(
@@ -1655,7 +1682,7 @@ serversRouter.get('/public/list', async (req, res) => {
 // ============ DÉCOUVERTE DE SERVEURS & BADGES ============
 
 // Admin: liste tous les serveurs avec statut badges (pour panneau admin)
-serversRouter.get('/admin/all', async (req, res) => {
+serversRouter.get('/admin/all', authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const db = getDb();
     const [rows] = await db.query<RowDataPacket[]>(
@@ -1673,7 +1700,7 @@ serversRouter.get('/admin/all', async (req, res) => {
 });
 
 // Admin: référencer directement un serveur (créer une candidature approuvée)
-serversRouter.post('/admin/feature/:serverId', async (req, res) => {
+serversRouter.post('/admin/feature/:serverId', authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const { serverId } = req.params;
     const reviewerId = (req as any).userId || req.headers['x-user-id'];
@@ -1701,7 +1728,7 @@ serversRouter.post('/admin/feature/:serverId', async (req, res) => {
 });
 
 // Admin: retirer un serveur de la découverte
-serversRouter.delete('/admin/feature/:serverId', async (req, res) => {
+serversRouter.delete('/admin/feature/:serverId', authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const { serverId } = req.params;
     const db = getDb();
@@ -1798,7 +1825,7 @@ serversRouter.get('/discover/applications', async (req, res) => {
 });
 
 // Admin: approuver/rejeter une candidature
-serversRouter.post('/discover/review/:applicationId', async (req, res) => {
+serversRouter.post('/discover/review/:applicationId', authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const { applicationId } = req.params;
     const { action } = req.body; // 'approved' | 'rejected'
@@ -1821,7 +1848,7 @@ serversRouter.post('/discover/review/:applicationId', async (req, res) => {
 });
 
 // Admin: mettre à jour les badges d'un serveur (certifié / partenaire)
-serversRouter.patch('/badges/:serverId', async (req, res) => {
+serversRouter.patch('/badges/:serverId', authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const { serverId } = req.params;
     const { isCertified, isPartnered } = req.body;
@@ -1858,6 +1885,590 @@ serversRouter.get('/badges/:serverId', async (req, res) => {
 });
 
 // ============ NETTOYAGE DES SERVEURS HORS LIGNE ============
+
+// =====================================================================
+// FORUM CHANNELS — Posts threadés dans un canal de type forum
+// =====================================================================
+
+// Récupérer les posts d'un canal forum
+serversRouter.get('/:serverId/channels/:channelId/posts',
+  authMiddleware,
+  async (req: AuthRequest, res) => {
+    try {
+      const { serverId, channelId } = req.params;
+      const limit = Math.min(parseInt(req.query.limit as string) || 30, 100);
+      const offset = parseInt(req.query.offset as string) || 0;
+      const db = getDb();
+      const [rows] = await db.query<RowDataPacket[]>(
+        `SELECT fp.id, fp.channel_id, fp.author_id, fp.title, fp.content, fp.tags,
+                fp.is_pinned, fp.is_locked, fp.reply_count, fp.last_reply_at, fp.created_at, fp.updated_at,
+                u.username as author_username, u.display_name as author_display_name, u.avatar_url as author_avatar_url
+         FROM forum_posts fp
+         LEFT JOIN users u ON fp.author_id = u.id
+         WHERE fp.channel_id = ? AND fp.server_id = ?
+         ORDER BY fp.is_pinned DESC, fp.last_reply_at DESC, fp.created_at DESC
+         LIMIT ? OFFSET ?`,
+        [channelId, serverId, String(limit), String(offset)]
+      );
+      res.json(rows);
+    } catch (error) {
+      logger.error('Erreur récupération posts forum:', error);
+      res.status(500).json({ error: 'Erreur serveur' });
+    }
+  }
+);
+
+// Créer un post dans un canal forum
+serversRouter.post('/:serverId/channels/:channelId/posts',
+  authMiddleware,
+  body('title').isString().isLength({ min: 1, max: 200 }),
+  body('content').isString().isLength({ min: 1, max: 10000 }),
+  body('tags').optional().isArray(),
+  async (req: AuthRequest, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+      const { serverId, channelId } = req.params;
+      const { title, content, tags } = req.body;
+      const authorId = req.userId!;
+      const db = getDb();
+      const postId = uuidv4();
+      await db.execute(
+        `INSERT INTO forum_posts (id, channel_id, server_id, author_id, title, content, tags)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [postId, channelId, serverId, authorId, title, content, tags ? JSON.stringify(tags) : null]
+      );
+      res.status(201).json({ id: postId, channelId, serverId, authorId, title, content, tags });
+    } catch (error) {
+      logger.error('Erreur création post forum:', error);
+      res.status(500).json({ error: 'Erreur serveur' });
+    }
+  }
+);
+
+// Récupérer un post forum par ID
+serversRouter.get('/:serverId/channels/:channelId/posts/:postId',
+  authMiddleware,
+  async (req: AuthRequest, res) => {
+    try {
+      const { serverId, channelId, postId } = req.params;
+      const db = getDb();
+      const [rows] = await db.query<RowDataPacket[]>(
+        `SELECT fp.*, u.username as author_username, u.display_name as author_display_name, u.avatar_url as author_avatar_url
+         FROM forum_posts fp LEFT JOIN users u ON fp.author_id = u.id
+         WHERE fp.id = ? AND fp.channel_id = ? AND fp.server_id = ?`,
+        [postId, channelId, serverId]
+      );
+      if (!rows.length) return res.status(404).json({ error: 'Post introuvable' });
+      res.json(rows[0]);
+    } catch (error) {
+      logger.error('Erreur récupération post forum:', error);
+      res.status(500).json({ error: 'Erreur serveur' });
+    }
+  }
+);
+
+// Mettre à jour un post forum (auteur uniquement)
+serversRouter.patch('/:serverId/channels/:channelId/posts/:postId',
+  authMiddleware,
+  body('title').optional().isString().isLength({ min: 1, max: 200 }),
+  body('content').optional().isString().isLength({ min: 1, max: 10000 }),
+  body('tags').optional().isArray(),
+  body('isLocked').optional().isBoolean(),
+  body('isPinned').optional().isBoolean(),
+  async (req: AuthRequest, res) => {
+    try {
+      const { serverId, channelId, postId } = req.params;
+      const db = getDb();
+      const [existing] = await db.query<RowDataPacket[]>(
+        'SELECT author_id FROM forum_posts WHERE id = ? AND channel_id = ? AND server_id = ?',
+        [postId, channelId, serverId]
+      );
+      if (!existing.length) return res.status(404).json({ error: 'Post introuvable' });
+      // Seul l'auteur ou un admin peut modifier
+      const [member] = await db.query<RowDataPacket[]>(
+        'SELECT role_ids FROM server_members WHERE server_id = ? AND user_id = ?',
+        [serverId, req.userId!]
+      );
+      const isOwnerOrAdmin = (
+        (existing[0] as any).author_id === req.userId ||
+        (member.length > 0)
+      );
+      if (!isOwnerOrAdmin) return res.status(403).json({ error: 'Non autorisé' });
+
+      const updates: string[] = [];
+      const params: any[] = [];
+      const { title, content, tags, isLocked, isPinned } = req.body;
+      if (title !== undefined) { updates.push('title = ?'); params.push(title); }
+      if (content !== undefined) { updates.push('content = ?'); params.push(content); }
+      if (tags !== undefined) { updates.push('tags = ?'); params.push(JSON.stringify(tags)); }
+      if (isLocked !== undefined) { updates.push('is_locked = ?'); params.push(isLocked ? 1 : 0); }
+      if (isPinned !== undefined) { updates.push('is_pinned = ?'); params.push(isPinned ? 1 : 0); }
+      if (updates.length === 0) return res.status(400).json({ error: 'Rien à modifier' });
+      params.push(postId);
+      await db.execute(`UPDATE forum_posts SET ${updates.join(', ')} WHERE id = ?`, params);
+      res.json({ success: true });
+    } catch (error) {
+      logger.error('Erreur modification post forum:', error);
+      res.status(500).json({ error: 'Erreur serveur' });
+    }
+  }
+);
+
+// Supprimer un post forum
+serversRouter.delete('/:serverId/channels/:channelId/posts/:postId',
+  authMiddleware,
+  async (req: AuthRequest, res) => {
+    try {
+      const { serverId, channelId, postId } = req.params;
+      const db = getDb();
+      const [existing] = await db.query<RowDataPacket[]>(
+        'SELECT author_id FROM forum_posts WHERE id = ? AND channel_id = ? AND server_id = ?',
+        [postId, channelId, serverId]
+      );
+      if (!existing.length) return res.status(404).json({ error: 'Post introuvable' });
+      if ((existing[0] as any).author_id !== req.userId) {
+        return res.status(403).json({ error: 'Non autorisé' });
+      }
+      await db.execute('DELETE FROM forum_posts WHERE id = ?', [postId]);
+      res.json({ success: true });
+    } catch (error) {
+      logger.error('Erreur suppression post forum:', error);
+      res.status(500).json({ error: 'Erreur serveur' });
+    }
+  }
+);
+
+// =====================================================================
+// ÉVÉNEMENTS PLANIFIÉS — Calendrier du serveur
+// =====================================================================
+
+// Récupérer les événements d'un serveur
+serversRouter.get('/:serverId/events',
+  authMiddleware,
+  async (req: AuthRequest, res) => {
+    try {
+      const { serverId } = req.params;
+      const status = req.query.status as string | undefined;
+      const db = getDb();
+      const params: any[] = [serverId];
+      let whereExtra = '';
+      if (status) { whereExtra = ' AND status = ?'; params.push(status); }
+      const [rows] = await db.query<RowDataPacket[]>(
+        `SELECT e.*, u.username as creator_username, u.display_name as creator_display_name, u.avatar_url as creator_avatar_url
+         FROM server_events e LEFT JOIN users u ON e.creator_id = u.id
+         WHERE e.server_id = ?${whereExtra} ORDER BY e.starts_at ASC`,
+        params
+      );
+      res.json(rows);
+    } catch (error) {
+      logger.error('Erreur récupération événements:', error);
+      res.status(500).json({ error: 'Erreur serveur' });
+    }
+  }
+);
+
+// Créer un événement
+serversRouter.post('/:serverId/events',
+  authMiddleware,
+  body('title').isString().isLength({ min: 1, max: 200 }),
+  body('startsAt').isISO8601(),
+  body('type').isIn(['voice', 'stage', 'external']),
+  body('description').optional().isString().isLength({ max: 1000 }),
+  body('channelId').optional().isString(),
+  body('location').optional().isString().isLength({ max: 200 }),
+  body('endsAt').optional().isISO8601(),
+  body('recurrence').optional().isIn(['none', 'daily', 'weekly', 'monthly']),
+  async (req: AuthRequest, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+      const { serverId } = req.params;
+      const { title, description, channelId, location, type, startsAt, endsAt, recurrence, coverUrl } = req.body;
+      const creatorId = req.userId!;
+      const db = getDb();
+      const eventId = uuidv4();
+      await db.execute(
+        `INSERT INTO server_events (id, server_id, channel_id, creator_id, title, description, cover_url, location, type, starts_at, ends_at, recurrence)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [eventId, serverId, channelId || null, creatorId, title, description || null, coverUrl || null, location || null, type, startsAt, endsAt || null, recurrence || 'none']
+      );
+      res.status(201).json({ id: eventId, serverId, creatorId, title, type, startsAt });
+    } catch (error) {
+      logger.error('Erreur création événement:', error);
+      res.status(500).json({ error: 'Erreur serveur' });
+    }
+  }
+);
+
+// Intérêt pour un événement (toggle)
+serversRouter.post('/:serverId/events/:eventId/interest',
+  authMiddleware,
+  async (req: AuthRequest, res) => {
+    try {
+      const { eventId } = req.params;
+      const userId = req.userId!;
+      const db = getDb();
+      const [existing] = await db.query<RowDataPacket[]>(
+        'SELECT 1 FROM server_event_interests WHERE event_id = ? AND user_id = ?',
+        [eventId, userId]
+      );
+      if (existing.length > 0) {
+        await db.execute('DELETE FROM server_event_interests WHERE event_id = ? AND user_id = ?', [eventId, userId]);
+        await db.execute('UPDATE server_events SET interested_count = GREATEST(0, interested_count - 1) WHERE id = ?', [eventId]);
+        res.json({ interested: false });
+      } else {
+        await db.execute('INSERT IGNORE INTO server_event_interests (event_id, user_id) VALUES (?, ?)', [eventId, userId]);
+        await db.execute('UPDATE server_events SET interested_count = interested_count + 1 WHERE id = ?', [eventId]);
+        res.json({ interested: true });
+      }
+    } catch (error) {
+      logger.error('Erreur intérêt événement:', error);
+      res.status(500).json({ error: 'Erreur serveur' });
+    }
+  }
+);
+
+// Mettre à jour le statut d'un événement
+serversRouter.patch('/:serverId/events/:eventId',
+  authMiddleware,
+  body('status').optional().isIn(['scheduled', 'active', 'ended', 'canceled']),
+  body('title').optional().isString().isLength({ max: 200 }),
+  async (req: AuthRequest, res) => {
+    try {
+      const { serverId, eventId } = req.params;
+      const db = getDb();
+      const [existing] = await db.query<RowDataPacket[]>(
+        'SELECT creator_id FROM server_events WHERE id = ? AND server_id = ?',
+        [eventId, serverId]
+      );
+      if (!existing.length) return res.status(404).json({ error: 'Événement introuvable' });
+      if ((existing[0] as any).creator_id !== req.userId) return res.status(403).json({ error: 'Non autorisé' });
+      const updates: string[] = [];
+      const params: any[] = [];
+      const { status, title, description, startsAt, endsAt } = req.body;
+      if (status) { updates.push('status = ?'); params.push(status); }
+      if (title) { updates.push('title = ?'); params.push(title); }
+      if (description !== undefined) { updates.push('description = ?'); params.push(description); }
+      if (startsAt) { updates.push('starts_at = ?'); params.push(startsAt); }
+      if (endsAt) { updates.push('ends_at = ?'); params.push(endsAt); }
+      if (updates.length === 0) return res.status(400).json({ error: 'Rien à modifier' });
+      params.push(eventId);
+      await db.execute(`UPDATE server_events SET ${updates.join(', ')} WHERE id = ?`, params);
+      res.json({ success: true });
+    } catch (error) {
+      logger.error('Erreur modification événement:', error);
+      res.status(500).json({ error: 'Erreur serveur' });
+    }
+  }
+);
+
+// Supprimer un événement
+serversRouter.delete('/:serverId/events/:eventId',
+  authMiddleware,
+  async (req: AuthRequest, res) => {
+    try {
+      const { serverId, eventId } = req.params;
+      const db = getDb();
+      const [existing] = await db.query<RowDataPacket[]>(
+        'SELECT creator_id FROM server_events WHERE id = ? AND server_id = ?',
+        [eventId, serverId]
+      );
+      if (!existing.length) return res.status(404).json({ error: 'Événement introuvable' });
+      if ((existing[0] as any).creator_id !== req.userId) return res.status(403).json({ error: 'Non autorisé' });
+      await db.execute('DELETE FROM server_event_interests WHERE event_id = ?', [eventId]);
+      await db.execute('DELETE FROM server_events WHERE id = ?', [eventId]);
+      res.json({ success: true });
+    } catch (error) {
+      logger.error('Erreur suppression événement:', error);
+      res.status(500).json({ error: 'Erreur serveur' });
+    }
+  }
+);
+
+// =====================================================================
+// AUTO-MODÉRATION — Règles de modération automatique du serveur
+// =====================================================================
+
+// Récupérer les règles automod d'un serveur
+serversRouter.get('/:serverId/automod',
+  authMiddleware,
+  async (req: AuthRequest, res) => {
+    try {
+      const { serverId } = req.params;
+      const db = getDb();
+      const [rows] = await db.query<RowDataPacket[]>(
+        `SELECT ar.*, u.username as created_by_username
+         FROM automod_rules ar LEFT JOIN users u ON ar.created_by = u.id
+         WHERE ar.server_id = ? ORDER BY ar.created_at ASC`,
+        [serverId]
+      );
+      res.json(rows);
+    } catch (error) {
+      logger.error('Erreur récupération règles automod:', error);
+      res.status(500).json({ error: 'Erreur serveur' });
+    }
+  }
+);
+
+// Créer une règle automod
+serversRouter.post('/:serverId/automod',
+  authMiddleware,
+  body('name').isString().isLength({ min: 1, max: 100 }),
+  body('triggerType').isIn(['keyword', 'spam', 'mention_spam', 'link', 'invite']),
+  body('actionType').isIn(['block', 'alert', 'timeout', 'delete']),
+  body('triggerMetadata').optional().isObject(),
+  body('actionMetadata').optional().isObject(),
+  async (req: AuthRequest, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+      const { serverId } = req.params;
+      const { name, triggerType, actionType, triggerMetadata, actionMetadata } = req.body;
+      const createdBy = req.userId!;
+      const db = getDb();
+      const ruleId = uuidv4();
+      await db.execute(
+        `INSERT INTO automod_rules (id, server_id, name, trigger_type, action_type, trigger_metadata, action_metadata, created_by)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [ruleId, serverId, name, triggerType, actionType,
+         triggerMetadata ? JSON.stringify(triggerMetadata) : null,
+         actionMetadata ? JSON.stringify(actionMetadata) : null,
+         createdBy]
+      );
+      res.status(201).json({ id: ruleId, serverId, name, triggerType, actionType });
+    } catch (error) {
+      logger.error('Erreur création règle automod:', error);
+      res.status(500).json({ error: 'Erreur serveur' });
+    }
+  }
+);
+
+// Activer/désactiver une règle automod
+serversRouter.patch('/:serverId/automod/:ruleId',
+  authMiddleware,
+  body('enabled').optional().isBoolean(),
+  body('name').optional().isString().isLength({ max: 100 }),
+  body('triggerMetadata').optional().isObject(),
+  body('actionMetadata').optional().isObject(),
+  async (req: AuthRequest, res) => {
+    try {
+      const { serverId, ruleId } = req.params;
+      const db = getDb();
+      const [existing] = await db.query<RowDataPacket[]>(
+        'SELECT 1 FROM automod_rules WHERE id = ? AND server_id = ?',
+        [ruleId, serverId]
+      );
+      if (!existing.length) return res.status(404).json({ error: 'Règle introuvable' });
+      const updates: string[] = [];
+      const params: any[] = [];
+      const { enabled, name, triggerMetadata, actionMetadata } = req.body;
+      if (enabled !== undefined) { updates.push('enabled = ?'); params.push(enabled ? 1 : 0); }
+      if (name !== undefined) { updates.push('name = ?'); params.push(name); }
+      if (triggerMetadata !== undefined) { updates.push('trigger_metadata = ?'); params.push(JSON.stringify(triggerMetadata)); }
+      if (actionMetadata !== undefined) { updates.push('action_metadata = ?'); params.push(JSON.stringify(actionMetadata)); }
+      if (updates.length === 0) return res.status(400).json({ error: 'Rien à modifier' });
+      params.push(ruleId);
+      await db.execute(`UPDATE automod_rules SET ${updates.join(', ')} WHERE id = ?`, params);
+      res.json({ success: true });
+    } catch (error) {
+      logger.error('Erreur modification règle automod:', error);
+      res.status(500).json({ error: 'Erreur serveur' });
+    }
+  }
+);
+
+// Supprimer une règle automod
+serversRouter.delete('/:serverId/automod/:ruleId',
+  authMiddleware,
+  async (req: AuthRequest, res) => {
+    try {
+      const { serverId, ruleId } = req.params;
+      const db = getDb();
+      await db.execute('DELETE FROM automod_rules WHERE id = ? AND server_id = ?', [ruleId, serverId]);
+      res.json({ success: true });
+    } catch (error) {
+      logger.error('Erreur suppression règle automod:', error);
+      res.status(500).json({ error: 'Erreur serveur' });
+    }
+  }
+);
+
+// Vérifier un message contre les règles automod d'un serveur (appelé par le service messages)
+serversRouter.post('/:serverId/automod/check',
+  async (req, res) => {
+    try {
+      const { serverId } = req.params;
+      const { content, userId } = req.body;
+      if (!content || typeof content !== 'string') {
+        return res.json({ blocked: false, reason: null });
+      }
+      const db = getDb();
+      const [rules] = await db.query<RowDataPacket[]>(
+        `SELECT trigger_type, trigger_metadata, action_type FROM automod_rules
+         WHERE server_id = ? AND enabled = TRUE`,
+        [serverId]
+      );
+      for (const rule of rules as any[]) {
+        if (rule.trigger_type === 'keyword') {
+          const meta = typeof rule.trigger_metadata === 'string' ? JSON.parse(rule.trigger_metadata) : rule.trigger_metadata;
+          const keywords: string[] = meta?.keywords || [];
+          const lowerContent = content.toLowerCase();
+          if (keywords.some((kw: string) => lowerContent.includes(kw.toLowerCase()))) {
+            if (rule.action_type === 'block' || rule.action_type === 'delete') {
+              return res.json({ blocked: true, reason: 'keyword_violation', action: rule.action_type });
+            }
+          }
+        } else if (rule.trigger_type === 'invite') {
+          if (/discord\.gg\/\w+/i.test(content)) {
+            if (rule.action_type === 'block' || rule.action_type === 'delete') {
+              return res.json({ blocked: true, reason: 'invite_link', action: rule.action_type });
+            }
+          }
+        } else if (rule.trigger_type === 'link') {
+          if (/https?:\/\//i.test(content)) {
+            if (rule.action_type === 'block' || rule.action_type === 'delete') {
+              return res.json({ blocked: true, reason: 'link_violation', action: rule.action_type });
+            }
+          }
+        }
+      }
+      res.json({ blocked: false, reason: null });
+    } catch (error) {
+      logger.error('Erreur check automod:', error);
+      res.json({ blocked: false, reason: null }); // fail-open
+    }
+  }
+);
+
+// =====================================================================
+// STAGE CHANNELS — Canaux broadcast (speakers vs listeners)
+// =====================================================================
+
+// Récupérer l'état d'un canal Stage
+serversRouter.get('/:serverId/stage/:channelId',
+  authMiddleware,
+  async (req: AuthRequest, res) => {
+    try {
+      const { channelId } = req.params;
+      const db = getDb();
+      const [rows] = await db.query<RowDataPacket[]>(
+        'SELECT * FROM stage_channel_state WHERE channel_id = ?',
+        [channelId]
+      );
+      if (!rows.length) {
+        return res.json({ channelId, isLive: false, speakerIds: [], listenerIds: [], topic: null });
+      }
+      const s = rows[0] as any;
+      res.json({
+        channelId: s.channel_id,
+        serverId: s.server_id,
+        topic: s.topic,
+        isLive: !!s.is_live,
+        speakerIds: s.speaker_ids ? (typeof s.speaker_ids === 'string' ? JSON.parse(s.speaker_ids) : s.speaker_ids) : [],
+        listenerIds: s.listener_ids ? (typeof s.listener_ids === 'string' ? JSON.parse(s.listener_ids) : s.listener_ids) : [],
+        startedAt: s.started_at,
+        startedBy: s.started_by,
+      });
+    } catch (error) {
+      logger.error('Erreur récupération stage:', error);
+      res.status(500).json({ error: 'Erreur serveur' });
+    }
+  }
+);
+
+// Démarrer / mettre à jour un Stage
+serversRouter.post('/:serverId/stage/:channelId/start',
+  authMiddleware,
+  body('topic').optional().isString().isLength({ max: 200 }),
+  async (req: AuthRequest, res) => {
+    try {
+      const { serverId, channelId } = req.params;
+      const { topic } = req.body;
+      const userId = req.userId!;
+      const db = getDb();
+      await db.execute(
+        `INSERT INTO stage_channel_state (channel_id, server_id, topic, is_live, speaker_ids, listener_ids, started_at, started_by)
+         VALUES (?, ?, ?, TRUE, ?, JSON_ARRAY(), NOW(), ?)
+         ON DUPLICATE KEY UPDATE topic = VALUES(topic), is_live = TRUE, started_at = NOW(), started_by = VALUES(started_by)`,
+        [channelId, serverId, topic || null, JSON.stringify([userId]), userId]
+      );
+      res.json({ success: true, channelId, isLive: true, topic });
+    } catch (error) {
+      logger.error('Erreur démarrage stage:', error);
+      res.status(500).json({ error: 'Erreur serveur' });
+    }
+  }
+);
+
+// Terminer un Stage
+serversRouter.post('/:serverId/stage/:channelId/end',
+  authMiddleware,
+  async (req: AuthRequest, res) => {
+    try {
+      const { channelId } = req.params;
+      const db = getDb();
+      await db.execute(
+        `UPDATE stage_channel_state SET is_live = FALSE, speaker_ids = JSON_ARRAY(), listener_ids = JSON_ARRAY() WHERE channel_id = ?`,
+        [channelId]
+      );
+      res.json({ success: true });
+    } catch (error) {
+      logger.error('Erreur fin stage:', error);
+      res.status(500).json({ error: 'Erreur serveur' });
+    }
+  }
+);
+
+// Rejoindre un Stage en tant que listener
+serversRouter.post('/:serverId/stage/:channelId/join',
+  authMiddleware,
+  body('role').isIn(['listener', 'speaker']),
+  async (req: AuthRequest, res) => {
+    try {
+      const { channelId } = req.params;
+      const userId = req.userId!;
+      const role = req.body.role || 'listener';
+      const db = getDb();
+      const column = role === 'speaker' ? 'speaker_ids' : 'listener_ids';
+      const removeColumn = role === 'speaker' ? 'listener_ids' : 'speaker_ids';
+      await db.execute(
+        `UPDATE stage_channel_state
+         SET ${column} = JSON_ARRAY_APPEND(${column}, '$', ?),
+             ${removeColumn} = JSON_REMOVE(${removeColumn}, IFNULL(JSON_SEARCH(${removeColumn}, 'one', ?), '$[99]'))
+         WHERE channel_id = ?`,
+        [userId, userId, channelId]
+      );
+      res.json({ success: true, role });
+    } catch (error) {
+      logger.error('Erreur join stage:', error);
+      res.status(500).json({ error: 'Erreur serveur' });
+    }
+  }
+);
+
+// Quitter un Stage
+serversRouter.post('/:serverId/stage/:channelId/leave',
+  authMiddleware,
+  async (req: AuthRequest, res) => {
+    try {
+      const { channelId } = req.params;
+      const userId = req.userId!;
+      const db = getDb();
+      await db.execute(
+        `UPDATE stage_channel_state
+         SET speaker_ids = JSON_REMOVE(speaker_ids, IFNULL(JSON_SEARCH(speaker_ids, 'one', ?), '$[99]')),
+             listener_ids = JSON_REMOVE(listener_ids, IFNULL(JSON_SEARCH(listener_ids, 'one', ?), '$[99]'))
+         WHERE channel_id = ?`,
+        [userId, userId, channelId]
+      );
+      res.json({ success: true });
+    } catch (error) {
+      logger.error('Erreur leave stage:', error);
+      res.status(500).json({ error: 'Erreur serveur' });
+    }
+  }
+);
 
 async function cleanupOfflineServers() {
   const cutoff = Date.now() - 60000; // 1 minute sans ping
@@ -1905,7 +2516,7 @@ const fileUpload = multer({
 });
 
 // POST /servers/:serverId/files — upload (utilisé en fallback sans node)
-app.post('/servers/:serverId/files', fileUpload.single('file'), (req: Request, res: Response) => {
+app.post('/servers/:serverId/files', authMiddleware, fileUpload.single('file'), (req: Request, res: Response) => {
   if (!req.file) return res.status(400).json({ error: 'Aucun fichier fourni' });
   const { serverId } = req.params;
   res.status(201).json({
@@ -1920,7 +2531,10 @@ app.post('/servers/:serverId/files', fileUpload.single('file'), (req: Request, r
 // GET /servers/:serverId/files/:filename — serve les fichiers
 app.get('/servers/:serverId/files/:filename', (req: Request, res: Response) => {
   const filename = path.basename(req.params.filename);
-  const filePath = path.join(UPLOADS_DIR, filename);
+  const filePath = path.resolve(UPLOADS_DIR, filename);
+  if (!filePath.startsWith(path.resolve(UPLOADS_DIR) + path.sep)) {
+    return res.status(403).json({ error: 'Accès refusé' });
+  }
   if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Fichier non trouvé' });
   res.sendFile(filePath);
 });
@@ -2133,6 +2747,91 @@ async function start() {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         INDEX idx_server_app (server_id),
         INDEX idx_status (status)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+
+      // ======================================================
+      // NOUVELLES FEATURES — FORUM, ÉVÉNEMENTS, AUTOMOD, STAGE
+      // ======================================================
+
+      // forum_posts: posts dans les canaux de type forum
+      `CREATE TABLE IF NOT EXISTS forum_posts (
+        id VARCHAR(36) PRIMARY KEY,
+        channel_id VARCHAR(36) NOT NULL,
+        server_id VARCHAR(36) NOT NULL,
+        author_id VARCHAR(36) NOT NULL,
+        title VARCHAR(200) NOT NULL,
+        content TEXT NOT NULL,
+        tags JSON NULL,
+        is_pinned BOOLEAN DEFAULT FALSE,
+        is_locked BOOLEAN DEFAULT FALSE,
+        reply_count INT DEFAULT 0,
+        last_reply_at TIMESTAMP NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_channel_posts (channel_id),
+        INDEX idx_server_posts (server_id),
+        INDEX idx_author_posts (author_id),
+        INDEX idx_last_reply (last_reply_at)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+
+      // server_events: événements planifiés dans un serveur (calendrier)
+      `CREATE TABLE IF NOT EXISTS server_events (
+        id VARCHAR(36) PRIMARY KEY,
+        server_id VARCHAR(36) NOT NULL,
+        channel_id VARCHAR(36) NULL,
+        creator_id VARCHAR(36) NOT NULL,
+        title VARCHAR(200) NOT NULL,
+        description TEXT NULL,
+        cover_url VARCHAR(500) NULL,
+        location VARCHAR(200) NULL,
+        type ENUM('voice', 'stage', 'external') DEFAULT 'voice',
+        status ENUM('scheduled', 'active', 'ended', 'canceled') DEFAULT 'scheduled',
+        starts_at DATETIME NOT NULL,
+        ends_at DATETIME NULL,
+        recurrence ENUM('none', 'daily', 'weekly', 'monthly') DEFAULT 'none',
+        interested_count INT DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_server_events (server_id),
+        INDEX idx_starts_at (starts_at),
+        INDEX idx_status_events (status)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+
+      // server_event_interests: utilisateurs intéressés par un événement
+      `CREATE TABLE IF NOT EXISTS server_event_interests (
+        event_id VARCHAR(36) NOT NULL,
+        user_id VARCHAR(36) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (event_id, user_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+
+      // automod_rules: règles d'auto-modération d'un serveur
+      `CREATE TABLE IF NOT EXISTS automod_rules (
+        id VARCHAR(36) PRIMARY KEY,
+        server_id VARCHAR(36) NOT NULL,
+        name VARCHAR(100) NOT NULL,
+        enabled BOOLEAN DEFAULT TRUE,
+        trigger_type ENUM('keyword', 'spam', 'mention_spam', 'link', 'invite') NOT NULL,
+        trigger_metadata JSON NULL COMMENT 'keywords[], exempted_roles[], etc.',
+        action_type ENUM('block', 'alert', 'timeout', 'delete') NOT NULL,
+        action_metadata JSON NULL COMMENT 'channel_id for alert, duration for timeout',
+        created_by VARCHAR(36) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_server_automod (server_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+
+      // stage_channel_state: état d'un canal Stage (speakers, listeners)
+      `CREATE TABLE IF NOT EXISTS stage_channel_state (
+        channel_id VARCHAR(36) PRIMARY KEY,
+        server_id VARCHAR(36) NOT NULL,
+        topic VARCHAR(200) NULL,
+        is_live BOOLEAN DEFAULT FALSE,
+        speaker_ids JSON NULL COMMENT 'IDs des intervenants',
+        listener_ids JSON NULL COMMENT 'IDs des auditeurs',
+        started_at TIMESTAMP NULL,
+        started_by VARCHAR(36) NULL,
+        INDEX idx_server_stage (server_id)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
     ];
 
