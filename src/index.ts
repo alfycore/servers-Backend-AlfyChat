@@ -1482,7 +1482,14 @@ serversRouter.post('/nodes/register', async (req, res) => {
     const defaultRoleId = uuidv4();
     const generalChannelId = uuidv4();
     const voiceChannelId = uuidv4();
-    const inviteCode = crypto.randomBytes(4).toString('hex').toUpperCase();
+    // Invite code 12 chars (~71 bits d'entropie) pour résister au brute-force
+    const inviteCode = (() => {
+      const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
+      const bytes = crypto.randomBytes(12);
+      let code = '';
+      for (let i = 0; i < 12; i++) code += chars[bytes[i] % chars.length];
+      return code;
+    })();
 
     await db.transaction(async (conn) => {
       await conn.execute(
