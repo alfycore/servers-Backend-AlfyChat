@@ -60,38 +60,9 @@ export function collectServiceMetrics() {
  * À appeler une fois dans le callback de `app.listen()`.
  */
 export function startServiceRegistration(serviceType: ServiceType): void {
-  const GATEWAY_URL     = process.env.GATEWAY_URL     || 'http://localhost:3000';
+  const GATEWAY_URL = process.env.GATEWAY_URL || 'http://localhost:3000';
   const SERVICE_KEY = process.env.SERVICE_KEY || process.env.INTERNAL_SECRET || '';
-  const SERVICE_ID      = process.env.SERVICE_ID      || `${serviceType}-default`;
-  const SERVICE_LOCATION = (process.env.SERVICE_LOCATION || 'EU').toUpperCase();
-  const PORT            = process.env.PORT            || '3000';
-  const SERVICE_ENDPOINT = process.env.SERVICE_ENDPOINT || `http://localhost:${PORT}`;
-  const SERVICE_DOMAIN  = process.env.SERVICE_DOMAIN  || `localhost:${PORT}`;
-
-  async function register() {
-    try {
-      const res = await fetch(`${GATEWAY_URL}/api/internal/service/register`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          secret: SERVICE_KEY,
-          id: SERVICE_ID,
-          serviceType,
-          endpoint: SERVICE_ENDPOINT,
-          domain: SERVICE_DOMAIN,
-          location: SERVICE_LOCATION,
-          metrics: collectServiceMetrics(),
-        }),
-      });
-      if (res.ok) {
-        console.log(`[ServiceClient] Enregistré au gateway (${SERVICE_ID})`);
-      } else {
-        console.warn(`[ServiceClient] Échec enregistrement: ${res.status}`);
-      }
-    } catch {
-      console.warn('[ServiceClient] Gateway non disponible, nouvelle tentative…');
-    }
-  }
+  const SERVICE_ID  = process.env.SERVICE_ID  || `${serviceType}-default`;
 
   async function heartbeat() {
     try {
@@ -105,22 +76,15 @@ export function startServiceRegistration(serviceType: ServiceType): void {
         }),
       });
       if (res.status === 404) {
-        // Gateway redémarré → ré-enregistrement
-        await register();
+        console.warn(`[ServiceClient] Instance "${SERVICE_ID}" inconnue du gateway — un administrateur doit l'ajouter via /api/admin/services`);
+      } else if (res.status === 401 || res.status === 403) {
+        console.warn(`[ServiceClient] Heartbeat refusé (${res.status}) — clé invalide ou instance bannie`);
       }
     } catch { /* non bloquant */ }
   }
 
-  // Premier enregistrement avec retries
-  let attempt = 0;
-  const tryRegister = async () => {
-    await register();
-    attempt++;
-    if (attempt < 5) setTimeout(tryRegister, attempt * 10_000);
-  };
-  setTimeout(tryRegister, 3_000);
-
-  // Heartbeat toutes les 30s
+  // Heartbeat immédiat puis toutes les 30s (pas d'auto-enregistrement : admin-only)
+  setTimeout(heartbeat, 3_000);
   setInterval(heartbeat, 30_000);
 }
 
