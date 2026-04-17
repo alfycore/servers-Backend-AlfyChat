@@ -20,7 +20,7 @@ export function initDatabase(config: {
     password: config.password,
     database: config.database,
     waitForConnections: true,
-    connectionLimit: 30,
+    connectionLimit: 10,
     queueLimit: 0,
     enableKeepAlive: true,
     keepAliveInitialDelay: 0,

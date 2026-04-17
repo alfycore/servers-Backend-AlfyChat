@@ -61,7 +61,7 @@ export function collectServiceMetrics() {
  */
 export function startServiceRegistration(serviceType: ServiceType): void {
   const GATEWAY_URL     = process.env.GATEWAY_URL     || 'http://localhost:3000';
-  const SERVICE_KEY = process.env.SERVICE_KEY || '';
+  const SERVICE_KEY = process.env.SERVICE_KEY || process.env.INTERNAL_SECRET || '';
   const SERVICE_ID      = process.env.SERVICE_ID      || `${serviceType}-default`;
   const SERVICE_LOCATION = (process.env.SERVICE_LOCATION || 'EU').toUpperCase();
   const PORT            = process.env.PORT            || '3000';
