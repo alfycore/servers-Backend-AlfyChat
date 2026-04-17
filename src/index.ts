@@ -431,9 +431,15 @@ serversRouter.post<ServerIdParams>('/:serverId/join',
 
       const server = (servers as any[])[0];
 
-      // Vérifier si le serveur est public ou si l'utilisateur a un code d'invitation
+      // Vérifier si le serveur est public, en découverte approuvée, ou si l'utilisateur a un code d'invitation
       if (!server.is_public && !inviteCode) {
-        return res.status(403).json({ error: 'Ce serveur nécessite une invitation' });
+        const [discoverRows] = await db.query(
+          "SELECT id FROM server_applications WHERE server_id = ? AND status = 'approved' LIMIT 1",
+          [serverId]
+        );
+        if ((discoverRows as any[]).length === 0) {
+          return res.status(403).json({ error: 'Ce serveur nécessite une invitation' });
+        }
       }
 
       // Vérifier le nombre de membres
