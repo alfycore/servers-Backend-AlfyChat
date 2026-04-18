@@ -3,6 +3,7 @@
 // ==========================================
 
 import { v4 as uuidv4 } from 'uuid';
+import crypto from 'crypto';
 import { getDatabaseClient } from '../database';
 import { getRedisClient } from '../redis';
 import { Server, Channel, ServerMember, Role, CreateServerDTO, CreateChannelDTO, CreateRoleDTO, ServerInvite } from '../types/server';
@@ -346,12 +347,19 @@ export class ServerService {
 
   // Helpers
   private generateInviteCode(): string {
+    // Alphabet sans caractères ambigus (I, O, 0, 1, l). Longueur 54 → on rejette
+    // les octets hors de [0, 216) pour garder une distribution uniforme.
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789';
-    let code = '';
-    for (let i = 0; i < 8; i++) {
-      code += chars.charAt(Math.floor(Math.random() * chars.length));
+    const codeLen = 10; // ~57 bits d'entropie, résistant au brute-force
+    const out: string[] = [];
+    const threshold = Math.floor(256 / chars.length) * chars.length;
+    while (out.length < codeLen) {
+      const buf = crypto.randomBytes(codeLen * 2);
+      for (let i = 0; i < buf.length && out.length < codeLen; i++) {
+        if (buf[i] < threshold) out.push(chars[buf[i] % chars.length]);
+      }
     }
-    return code;
+    return out.join('');
   }
 
   private formatServer(row: any, channels: Channel[], roles: Role[]): Server {

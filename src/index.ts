@@ -34,22 +34,27 @@ interface AuthRequest extends Request {
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) throw new Error('JWT_SECRET environment variable is required');
 
+const INTERNAL_SECRET = process.env.INTERNAL_SECRET;
+if (!INTERNAL_SECRET) throw new Error('INTERNAL_SECRET environment variable is required — refusing to start without it');
+
+function safeCompare(a: string, b: string): boolean {
+  if (!a || !b) return false;
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
 function authMiddleware(req: AuthRequest, res: Response, next: NextFunction): void {
   // Bypass interne : requêtes du gateway avec x-internal-secret
   const internalSecret = req.headers['x-internal-secret'] as string | undefined;
-  const internalEnv = process.env.INTERNAL_SECRET;
-  if (internalEnv && internalSecret && internalSecret === internalEnv) {
+  if (internalSecret && safeCompare(internalSecret, INTERNAL_SECRET)) {
     const xUserId = req.headers['x-user-id'] as string | undefined;
     req.userId = xUserId ?? 'internal';
     return next();
   }
 
-  // Trust x-user-id set by the gateway (internal network) OR verify Bearer JWT
-  const xUserId = req.headers['x-user-id'] as string | undefined;
-  if (xUserId) {
-    req.userId = xUserId;
-    return next();
-  }
+  // x-user-id sans secret valide est IGNORÉ — pas de fallback silencieux
 
   const authHeader = req.headers.authorization;
   if (!authHeader?.startsWith('Bearer ')) {
@@ -83,6 +88,89 @@ async function adminMiddleware(req: AuthRequest, res: Response, next: NextFuncti
 
 interface ServerIdParams {
   serverId: string;
+}
+
+// ==========================================
+// PERMISSION FLAGS & HELPER
+// ==========================================
+const PERM = {
+  READ:             0x1,
+  SEND:             0x2,
+  REACT:            0x4,
+  MANAGE_MESSAGES:  0x8,
+  KICK:             0x10,
+  BAN:              0x20,
+  ADMIN:            0x40,
+  MANAGE_CHANNELS:  0x80,
+  MANAGE_ROLES:     0x100,
+  ALL:              0x1FF,
+} as const;
+
+/**
+ * Vérifie si l'utilisateur a les permissions requises sur un serveur.
+ * Retourne true si l'utilisateur est owner OU si au moins un de ses rôles
+ * a le flag demandé (ou ADMIN qui donne tout).
+ */
+async function hasPermission(userId: string, serverId: string, requiredFlag: number): Promise<boolean> {
+  const db = getDb();
+
+  // Owner a toutes les permissions
+  const [serverRows] = await db.query<RowDataPacket[]>(
+    'SELECT owner_id FROM servers WHERE id = ?', [serverId]
+  );
+  if (!serverRows.length) return false;
+  if (serverRows[0].owner_id === userId) return true;
+
+  // Récupérer les rôles du membre
+  const [memberRows] = await db.query<RowDataPacket[]>(
+    'SELECT role_ids FROM server_members WHERE server_id = ? AND user_id = ?',
+    [serverId, userId]
+  );
+  if (!memberRows.length) return false;
+
+  let roleIds: string[];
+  try {
+    roleIds = typeof memberRows[0].role_ids === 'string'
+      ? JSON.parse(memberRows[0].role_ids)
+      : memberRows[0].role_ids || [];
+  } catch {
+    roleIds = [];
+  }
+  if (!roleIds.length) return false;
+
+  // Récupérer les permissions des rôles
+  const placeholders = roleIds.map(() => '?').join(',');
+  const [roles] = await db.query<RowDataPacket[]>(
+    `SELECT permissions FROM roles WHERE id IN (${placeholders}) AND server_id = ?`,
+    [...roleIds, serverId]
+  );
+
+  for (const role of roles) {
+    let perms: number;
+    try {
+      perms = typeof role.permissions === 'string' ? JSON.parse(role.permissions) : (role.permissions ?? 0);
+    } catch {
+      perms = 0;
+    }
+    // Mask to valid range to prevent permissions:-1 or 0x80000000 bypass
+    perms = perms & PERM.ALL;
+    // ADMIN flag grants everything
+    if (perms & PERM.ADMIN) return true;
+    if (perms & requiredFlag) return true;
+  }
+
+  return false;
+}
+
+/**
+ * Vérifie que l'utilisateur est le propriétaire du serveur.
+ */
+async function isOwner(userId: string, serverId: string): Promise<boolean> {
+  const db = getDb();
+  const [rows] = await db.query<RowDataPacket[]>(
+    'SELECT owner_id FROM servers WHERE id = ?', [serverId]
+  );
+  return rows.length > 0 && rows[0].owner_id === userId;
 }
 
 interface ServerChannelParams {
@@ -744,6 +832,13 @@ serversRouter.post('/',
 serversRouter.patch<ServerIdParams>('/:serverId', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const { serverId } = req.params;
+    const userId = req.userId!;
+
+    // Seul le owner ou un admin peut modifier le serveur
+    if (!(await hasPermission(userId, serverId, PERM.ADMIN))) {
+      return res.status(403).json({ error: 'Permission insuffisante — ADMIN requis' });
+    }
+
     const { name, description, iconUrl, bannerUrl, isPublic } = req.body;
     const db = getDb();
 
@@ -773,6 +868,13 @@ serversRouter.patch<ServerIdParams>('/:serverId', authMiddleware, async (req: Au
 serversRouter.delete<ServerIdParams>('/:serverId', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const { serverId } = req.params;
+    const userId = req.userId!;
+
+    // Seul le propriétaire peut supprimer un serveur
+    if (!(await isOwner(userId, serverId))) {
+      return res.status(403).json({ error: 'Seul le propriétaire peut supprimer ce serveur' });
+    }
+
     const db = getDb();
 
     await db.execute('DELETE FROM server_members WHERE server_id = ?', [serverId]);
@@ -848,7 +950,26 @@ serversRouter.get<ServerIdParams>('/:serverId/members', async (req, res) => {
 serversRouter.patch('/:serverId/members/:userId', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const { serverId, userId } = req.params;
+    const actorId = req.userId!;
     const { roleIds, nickname } = req.body;
+
+    // Modifier son propre nickname ne requiert pas de permission spéciale
+    // Modifier les rôles d'un autre nécessite ADMIN
+    if (roleIds !== undefined && actorId !== userId) {
+      if (!(await hasPermission(actorId, serverId, PERM.ADMIN))) {
+        return res.status(403).json({ error: 'Permission insuffisante — ADMIN requis pour modifier les rôles' });
+      }
+      // Empêcher de modifier les rôles du owner
+      if (await isOwner(userId, serverId)) {
+        return res.status(403).json({ error: 'Impossible de modifier les rôles du propriétaire' });
+      }
+    }
+    if (nickname !== undefined && actorId !== userId) {
+      if (!(await hasPermission(actorId, serverId, PERM.ADMIN))) {
+        return res.status(403).json({ error: 'Permission insuffisante pour modifier le nickname d\'un autre membre' });
+      }
+    }
+
     const db = getDb();
 
     const updates: string[] = [];
@@ -906,16 +1027,26 @@ serversRouter.get<ServerIdParams>('/:serverId/roles', async (req, res) => {
 
 serversRouter.patch('/:serverId/roles/:roleId', authMiddleware, async (req, res) => {
   try {
-    const { roleId } = req.params;
+    const { serverId, roleId } = req.params;
+    const actorId = (req as AuthRequest).userId!;
+
+    // Vérifier la permission MANAGE_ROLES
+    if (!(await hasPermission(actorId, serverId, PERM.MANAGE_ROLES))) {
+      return res.status(403).json({ error: 'Permission insuffisante — MANAGE_ROLES requis' });
+    }
+
     const { name, color, permissions, iconEmoji, iconUrl, position } = req.body;
     const db = getDb();
+
+    // Masquer les permissions à la plage valide
+    const safePermissions = permissions !== undefined ? (permissions & PERM.ALL) : undefined;
 
     const updates: string[] = [];
     const params: any[] = [];
 
     if (name !== undefined) { updates.push('name = ?'); params.push(name); }
     if (color !== undefined) { updates.push('color = ?'); params.push(color); }
-    if (permissions !== undefined) { updates.push('permissions = ?'); params.push(JSON.stringify(permissions)); }
+    if (safePermissions !== undefined) { updates.push('permissions = ?'); params.push(JSON.stringify(safePermissions)); }
     if (iconEmoji !== undefined) { updates.push('icon_emoji = ?'); params.push(iconEmoji); }
     if (iconUrl !== undefined) { updates.push('icon_url = ?'); params.push(iconUrl); }
     if (position !== undefined) { updates.push('position = ?'); params.push(position); }
@@ -934,7 +1065,14 @@ serversRouter.patch('/:serverId/roles/:roleId', authMiddleware, async (req, res)
 
 serversRouter.delete('/:serverId/roles/:roleId', authMiddleware, async (req, res) => {
   try {
-    const { roleId } = req.params;
+    const { serverId, roleId } = req.params;
+    const actorId = (req as AuthRequest).userId!;
+
+    // Vérifier la permission MANAGE_ROLES
+    if (!(await hasPermission(actorId, serverId, PERM.MANAGE_ROLES))) {
+      return res.status(403).json({ error: 'Permission insuffisante — MANAGE_ROLES requis' });
+    }
+
     const db = getDb();
     await db.execute('DELETE FROM roles WHERE id = ? AND is_default = FALSE', [roleId]);
     res.json({ success: true });
@@ -946,16 +1084,25 @@ serversRouter.delete('/:serverId/roles/:roleId', authMiddleware, async (req, res
 
 // ============ INVITATIONS ============
 
-serversRouter.post<ServerIdParams>('/:serverId/invites', async (req, res) => {
+serversRouter.post<ServerIdParams>('/:serverId/invites', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const { serverId } = req.params;
+    const creatorId = req.userId!;
     const { maxUses, expiresIn, customSlug, isPermanent = false } = req.body;
-    // Le gateway injecte userId dans le body — on l'utilise comme creatorId
-    const creatorId = req.body.creatorId || req.body.userId || req.headers['x-user-id'] as string;
+
+    // Vérifier que l'utilisateur est bien membre du serveur
+    const db = getDb();
+    const [memberCheck] = await db.query<RowDataPacket[]>(
+      'SELECT user_id FROM server_members WHERE server_id = ? AND user_id = ?',
+      [serverId, creatorId]
+    );
+    if ((memberCheck as any[]).length === 0) {
+      return res.status(403).json({ error: 'Vous devez être membre du serveur pour créer une invitation' });
+    }
+
     if (!creatorId) {
       return res.status(400).json({ error: 'creatorId requis' });
     }
-    const db = getDb();
 
     // Vérifier unicité du slug personnalisé
     if (customSlug) {
@@ -1024,10 +1171,24 @@ serversRouter.get<ServerIdParams>('/:serverId/invites', async (req, res) => {
   }
 });
 
-serversRouter.delete('/invites/:inviteId', authMiddleware, async (req, res) => {
+serversRouter.delete('/invites/:inviteId', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const { inviteId } = req.params;
+    const actorId = req.userId!;
     const db = getDb();
+
+    // Vérifier que l'utilisateur est le créateur de l'invite ou admin du serveur
+    const [inviteRows] = await db.query<RowDataPacket[]>(
+      'SELECT creator_id, server_id FROM server_invites WHERE id = ?', [inviteId]
+    );
+    if (!(inviteRows as any[]).length) {
+      return res.status(404).json({ error: 'Invitation non trouvée' });
+    }
+    const invite = (inviteRows as any[])[0];
+    if (invite.creator_id !== actorId && !(await hasPermission(actorId, invite.server_id, PERM.ADMIN))) {
+      return res.status(403).json({ error: 'Permission insuffisante — créateur ou ADMIN requis' });
+    }
+
     await db.execute('DELETE FROM server_invites WHERE id = ?', [inviteId]);
     res.json({ success: true });
   } catch (error) {
@@ -1466,9 +1627,13 @@ serversRouter.post<ServerIdParams>('/:serverId/domain/check', async (req, res) =
 
 // ============ NODE TOKEN (server-node self-hosted) ============
 
-serversRouter.get<ServerIdParams>('/:serverId/node-token', async (req, res) => {
+serversRouter.get<ServerIdParams>('/:serverId/node-token', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const { serverId } = req.params;
+    const userId = req.userId!;
+    if (!(await hasPermission(userId, serverId, PERM.ADMIN))) {
+      return res.status(403).json({ error: 'Admin requis' });
+    }
     const db = getDb();
     const [servers] = await db.query('SELECT node_token FROM servers WHERE id = ?', [serverId]);
     if (!(servers as any[]).length) return res.status(404).json({ error: 'Serveur non trouvé' });
@@ -1479,7 +1644,8 @@ serversRouter.get<ServerIdParams>('/:serverId/node-token', async (req, res) => {
 });
 
 // Enregistrement automatique d'un nouveau server-node (sans owner, owner sera défini par claim-admin)
-serversRouter.post('/nodes/register', async (req, res) => {
+// Auth requise : évite la pollution DB illimitée par un attaquant anonyme.
+serversRouter.post('/nodes/register', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const db = getDb();
     const serverId = uuidv4();
@@ -1554,29 +1720,32 @@ serversRouter.post('/nodes/validate', async (req, res) => {
 
 // ============ CLAIM ADMIN (code généré par le server-node) ============
 
-serversRouter.post<ServerIdParams>('/:serverId/claim-admin', async (req, res) => {
+serversRouter.post<ServerIdParams>('/:serverId/claim-admin', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const { serverId } = req.params;
-    const { userId, code } = req.body;
+    const userId = req.userId!;
+    const { code } = req.body;
 
-    if (!userId || !code) {
-      return res.status(400).json({ error: 'userId et code requis' });
+    if (!code) {
+      return res.status(400).json({ error: 'code requis' });
     }
 
-    // Vérifier le code dans Redis (clé partagée avec le gateway)
-    const storedCode = await redis.get(`setup_code:${serverId}`);
+    // Atomic GETDEL pour éviter le TOCTOU (deux users claim simultanément)
+    const storedCode = await redis.getdel(`setup_code:${serverId}`);
     if (!storedCode || storedCode.toUpperCase() !== String(code).toUpperCase()) {
       return res.status(403).json({ error: 'Code invalide ou expiré' });
     }
 
     const db = getDb();
 
-    // Invalider le code immédiatement (usage unique)
-    await redis.del(`setup_code:${serverId}`);
-
-    // Vérifier que le serveur existe
+    // Vérifier que le serveur existe ET n'a pas encore de owner
     const [servers] = await db.query('SELECT id, owner_id FROM servers WHERE id = ?', [serverId]);
     if (!(servers as any[]).length) return res.status(404).json({ error: 'Serveur non trouvé' });
+
+    const server = (servers as any[])[0];
+    if (server.owner_id) {
+      return res.status(409).json({ error: 'Ce serveur a déjà un propriétaire' });
+    }
 
     // Créer (ou récupérer) le rôle Propriétaire avec toutes les permissions
     let adminRoleId: string;
@@ -1633,11 +1802,8 @@ serversRouter.post<ServerIdParams>('/:serverId/claim-admin', async (req, res) =>
       );
     }
 
-    // Mettre à jour le owner_id si pas encore défini
-    const server = (servers as any[])[0];
-    if (!server.owner_id) {
-      await db.execute('UPDATE servers SET owner_id = ? WHERE id = ?', [userId, serverId]);
-    }
+    // Mettre à jour le owner_id (on a déjà vérifié qu'il est NULL)
+    await db.execute('UPDATE servers SET owner_id = ? WHERE id = ? AND owner_id IS NULL', [userId, serverId]);
 
     logger.info(`✅ Droits admin réclamés par ${userId} sur le serveur ${serverId}`);
     res.json({ success: true, message: 'Droits admin accordés avec succès' });
