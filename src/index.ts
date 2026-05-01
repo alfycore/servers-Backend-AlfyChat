@@ -4,10 +4,13 @@
 // Le système central gère uniquement l'annuaire et les métadonnées
 // ==========================================
 
+import dotenv from 'dotenv';
+dotenv.config();
+import { registerGlobalErrorHandlers } from './utils/error-reporter';
+registerGlobalErrorHandlers();
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
-import dotenv from 'dotenv';
 import { Router } from 'express';
 import { body, validationResult } from 'express-validator';
 import { v4 as uuidv4 } from 'uuid';

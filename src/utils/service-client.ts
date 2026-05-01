@@ -56,36 +56,82 @@ export function collectServiceMetrics() {
 }
 
 /**
- * Démarre la boucle d'enregistrement + heartbeat auprès du gateway.
+ * Démarre l'enregistrement + heartbeat auprès du gateway via le nouveau système LB.
+ * Utilise SERVICE_KEY (sk_...) pour s'authentifier.
  * À appeler une fois dans le callback de `app.listen()`.
  */
 export function startServiceRegistration(serviceType: ServiceType): void {
-  const GATEWAY_URL = process.env.GATEWAY_URL || 'http://localhost:3000';
-  const SERVICE_KEY = process.env.SERVICE_KEY || process.env.INTERNAL_SECRET || '';
-  const SERVICE_ID  = process.env.SERVICE_ID  || `${serviceType}-default`;
+  const GATEWAY_URL       = process.env.GATEWAY_URL       || 'http://localhost:3000';
+  const SERVICE_KEY       = process.env.SERVICE_KEY       || '';
+  const SERVICE_ENDPOINT  = process.env.SERVICE_ENDPOINT  || '';
+
+  let _registeredId: string | null = null;
+  let _heartbeatTimer: NodeJS.Timeout | null = null;
+
+  async function register() {
+    if (!SERVICE_KEY) {
+      console.warn(`[ServiceClient] SERVICE_KEY absent — service "${serviceType}" non enregistré auprès du gateway`);
+      return;
+    }
+    if (!SERVICE_ENDPOINT) {
+      console.warn(`[ServiceClient] SERVICE_ENDPOINT absent — impossible de s'enregistrer`);
+      return;
+    }
+    try {
+      const res = await fetch(`${GATEWAY_URL}/api/lb/register`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Service-Key': SERVICE_KEY },
+        body:    JSON.stringify({ endpoint: SERVICE_ENDPOINT }),
+        signal:  AbortSignal.timeout(8000),
+      });
+      const data = await res.json() as any;
+      if (res.ok && data.serviceId) {
+        _registeredId = data.serviceId;
+        console.info(`[ServiceClient] Connecté — serviceId: ${_registeredId} via ${data.gatewayId}`);
+        startHeartbeat();
+      } else {
+        console.error(`[ServiceClient] Enregistrement refusé: ${data.error ?? JSON.stringify(data)}`);
+        console.warn(`[ServiceClient] → Vérifiez SERVICE_KEY dans votre .env et que le service est créé dans l'admin panel`);
+      }
+    } catch (err) {
+      console.error('[ServiceClient] Erreur réseau lors de l\'enregistrement:', err);
+      setTimeout(register, 15_000);
+    }
+  }
 
   async function heartbeat() {
+    if (!SERVICE_KEY || !_registeredId) return;
     try {
-      const res = await fetch(`${GATEWAY_URL}/api/internal/service/heartbeat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          secret: SERVICE_KEY,
-          id: SERVICE_ID,
-          metrics: collectServiceMetrics(),
-        }),
+      const res = await fetch(`${GATEWAY_URL}/api/lb/heartbeat`, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Service-Key': SERVICE_KEY },
+        body:    JSON.stringify({ metrics: collectServiceMetrics() }),
+        signal:  AbortSignal.timeout(5000),
       });
+      if (res.status === 403) {
+        if (_heartbeatTimer) { clearInterval(_heartbeatTimer); _heartbeatTimer = null; }
+        return;
+      }
       if (res.status === 404) {
-        console.warn(`[ServiceClient] Instance "${SERVICE_ID}" inconnue du gateway — un administrateur doit l'ajouter via /api/admin/services`);
-      } else if (res.status === 401 || res.status === 403) {
-        console.warn(`[ServiceClient] Heartbeat refusé (${res.status}) — clé invalide ou instance bannie`);
+        console.warn('[ServiceClient] Service inconnu du gateway — ré-enregistrement...');
+        _registeredId = null;
+        if (_heartbeatTimer) { clearInterval(_heartbeatTimer); _heartbeatTimer = null; }
+        setTimeout(register, 3000);
       }
     } catch { /* non bloquant */ }
   }
 
-  // Heartbeat immédiat puis toutes les 30s (pas d'auto-enregistrement : admin-only)
-  setTimeout(heartbeat, 3_000);
-  setInterval(heartbeat, 30_000);
+  function startHeartbeat() {
+    if (_heartbeatTimer) clearInterval(_heartbeatTimer);
+    _heartbeatTimer = setInterval(heartbeat, 30_000);
+    if ((_heartbeatTimer as any).unref) (_heartbeatTimer as any).unref();
+  }
+
+  // Démarrage différé pour laisser le serveur s'initialiser
+  setTimeout(register, 2_000);
+
+  // Ré-essai si pas encore enregistré après 15s
+  setTimeout(() => { if (!_registeredId) register(); }, 15_000);
 }
 
 /**
