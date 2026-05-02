@@ -639,7 +639,7 @@ serversRouter.get<ServerIdParams>('/:serverId/channels', async (req, res) => {
 serversRouter.post<ServerIdParams>('/:serverId/channels',
   authMiddleware,
   body('name').isLength({ min: 1, max: 100 }),
-  body('type').isIn(['text', 'voice', 'announcement', 'category', 'forum', 'stage', 'gallery', 'poll', 'suggestion', 'doc', 'counting', 'vent', 'thread', 'media']),
+  body('type').isIn(['text', 'voice', 'announcement', 'category', 'forum', 'stage', 'gallery', 'poll', 'suggestion', 'doc', 'counting', 'vent', 'thread', 'media', 'minigame', 'trivia']),
   async (req, res) => {
     try {
       const errors = validationResult(req);
