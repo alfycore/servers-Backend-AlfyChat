@@ -2824,7 +2824,7 @@ async function start() {
         id VARCHAR(36) PRIMARY KEY,
         server_id VARCHAR(36) NOT NULL,
         name VARCHAR(100) NOT NULL,
-        type ENUM('text', 'voice', 'announcement', 'category', 'forum', 'stage', 'gallery', 'poll', 'suggestion', 'doc', 'counting', 'vent', 'thread', 'media') NOT NULL,
+        type ENUM('text', 'voice', 'announcement', 'category', 'forum', 'stage', 'gallery', 'poll', 'suggestion', 'doc', 'counting', 'vent', 'thread', 'media', 'minigame', 'trivia') NOT NULL,
         parent_id VARCHAR(36),
         position INT DEFAULT 0,
         topic TEXT,
@@ -2942,7 +2942,7 @@ async function start() {
       `ALTER TABLE channels ADD COLUMN slow_mode INT DEFAULT 0`,
 
       // Mise à jour de l'ENUM type pour les nouveaux types de canaux
-      `ALTER TABLE channels MODIFY COLUMN type ENUM('text', 'voice', 'announcement', 'category', 'forum', 'stage', 'gallery', 'poll', 'suggestion', 'doc', 'counting', 'vent', 'thread', 'media') NOT NULL`,
+      `ALTER TABLE channels MODIFY COLUMN type ENUM('text', 'voice', 'announcement', 'category', 'forum', 'stage', 'gallery', 'poll', 'suggestion', 'doc', 'counting', 'vent', 'thread', 'media', 'minigame', 'trivia') NOT NULL`,
 
       // Colonnes additionnelles pour server_messages
       `ALTER TABLE server_messages ADD COLUMN is_pinned BOOLEAN DEFAULT FALSE`,

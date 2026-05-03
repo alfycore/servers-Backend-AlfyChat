@@ -63,25 +63,33 @@ export function collectServiceMetrics() {
 export function startServiceRegistration(serviceType: ServiceType): void {
   const GATEWAY_URL       = process.env.GATEWAY_URL       || 'http://localhost:3000';
   const SERVICE_KEY       = process.env.SERVICE_KEY       || '';
+  const SERVICE_ID        = process.env.SERVICE_ID        || '';
+  const INTERNAL_SECRET   = process.env.INTERNAL_SECRET   || '';
   const SERVICE_ENDPOINT  = process.env.SERVICE_ENDPOINT  || '';
 
   let _registeredId: string | null = null;
   let _heartbeatTimer: NodeJS.Timeout | null = null;
 
   async function register() {
-    if (!SERVICE_KEY) {
-      console.warn(`[ServiceClient] SERVICE_KEY absent — service "${serviceType}" non enregistré auprès du gateway`);
+    if (!SERVICE_KEY && !INTERNAL_SECRET) {
+      console.warn(`[ServiceClient] SERVICE_KEY et INTERNAL_SECRET absents — service "${serviceType}" non enregistré`);
       return;
     }
     if (!SERVICE_ENDPOINT) {
       console.warn(`[ServiceClient] SERVICE_ENDPOINT absent — impossible de s'enregistrer`);
       return;
     }
+    const useKey = !!SERVICE_KEY;
+    const regHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (useKey) regHeaders['X-Service-Key'] = SERVICE_KEY;
+    else regHeaders['X-Internal-Secret'] = INTERNAL_SECRET;
+    const regBody: Record<string, string> = { endpoint: SERVICE_ENDPOINT };
+    if (!useKey && SERVICE_ID) regBody.serviceId = SERVICE_ID;
     try {
       const res = await fetch(`${GATEWAY_URL}/api/lb/register`, {
         method:  'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Service-Key': SERVICE_KEY },
-        body:    JSON.stringify({ endpoint: SERVICE_ENDPOINT }),
+        headers: regHeaders,
+        body:    JSON.stringify(regBody),
         signal:  AbortSignal.timeout(8000),
       });
       const data = await res.json() as any;
@@ -100,12 +108,18 @@ export function startServiceRegistration(serviceType: ServiceType): void {
   }
 
   async function heartbeat() {
-    if (!SERVICE_KEY || !_registeredId) return;
+    if (!_registeredId) return;
+    if (!SERVICE_KEY && !INTERNAL_SECRET) return;
+    const hbHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (SERVICE_KEY) hbHeaders['X-Service-Key'] = SERVICE_KEY;
+    else hbHeaders['X-Internal-Secret'] = INTERNAL_SECRET;
+    const hbBody: Record<string, any> = { metrics: collectServiceMetrics() };
+    if (!SERVICE_KEY) hbBody.serviceId = _registeredId;
     try {
       const res = await fetch(`${GATEWAY_URL}/api/lb/heartbeat`, {
         method:  'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Service-Key': SERVICE_KEY },
-        body:    JSON.stringify({ metrics: collectServiceMetrics() }),
+        headers: hbHeaders,
+        body:    JSON.stringify(hbBody),
         signal:  AbortSignal.timeout(5000),
       });
       if (res.status === 403) {
