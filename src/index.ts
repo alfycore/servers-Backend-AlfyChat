@@ -2782,7 +2782,13 @@ async function start() {
       user: process.env.DB_USER || 'alfychat',
       password: process.env.DB_PASSWORD || 'alfychat',
       database: process.env.DB_NAME || 'alfychat',
+      waitForConnections: true,
       connectionLimit: 10,
+      queueLimit: 0,
+      enableKeepAlive: true,
+      keepAliveInitialDelay: 0,
+      connectTimeout: 10000,
+      idleTimeout: 60000,
     });
 
     redis = new Redis({
