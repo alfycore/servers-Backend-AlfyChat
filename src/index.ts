@@ -2712,6 +2712,22 @@ async function cleanupAbandonedNodeServers() {
   }
 }
 
+// ── Endpoint interne — stats publiques (protégé par x-internal-secret) ───────
+serversRouter.get('/internal/stats', async (req, res) => {
+  const secret = req.headers['x-internal-secret'] as string | undefined;
+  if (!secret || !safeCompare(secret, INTERNAL_SECRET)) {
+    return res.status(401).json({ error: 'Non autorisé' });
+  }
+  try {
+    const db = getDb();
+    const [[totalRow]] = await db.query('SELECT COUNT(*) as count FROM servers') as any;
+    const [[membersRow]] = await db.query('SELECT COUNT(*) as count FROM server_members') as any;
+    res.json({ totalServers: totalRow.count, totalMembers: membersRow.count });
+  } catch {
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
 app.use('/servers', serversRouter);
 
 // ── Upload de fichiers (fallback sans server-node) ─────────────────────────
