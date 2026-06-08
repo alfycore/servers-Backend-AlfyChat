@@ -40,7 +40,7 @@ if (!JWT_SECRET) throw new Error('JWT_SECRET environment variable is required');
 const INTERNAL_SECRET = process.env.INTERNAL_SECRET;
 if (!INTERNAL_SECRET) throw new Error('INTERNAL_SECRET environment variable is required — refusing to start without it');
 
-function safeCompare(a: string, b: string): boolean {
+function safeCompare(a: string | undefined, b: string | undefined): boolean {
   if (!a || !b) return false;
   const bufA = Buffer.from(a);
   const bufB = Buffer.from(b);
