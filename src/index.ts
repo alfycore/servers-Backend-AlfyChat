@@ -176,6 +176,39 @@ async function isOwner(userId: string, serverId: string): Promise<boolean> {
   return rows.length > 0 && rows[0].owner_id === userId;
 }
 
+/** Consigne une action de modération/administration — best-effort, ne doit jamais faire échouer l'action elle-même. */
+async function logAudit(
+  serverId: string,
+  actorId: string,
+  action: string,
+  target?: { type: string; id?: string | null },
+  metadata?: Record<string, unknown>,
+): Promise<void> {
+  try {
+    const db = getDb();
+    await db.execute(
+      `INSERT INTO audit_logs (id, server_id, actor_id, action, target_type, target_id, metadata) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [uuidv4(), serverId, actorId, action, target?.type ?? null, target?.id ?? null, metadata ? JSON.stringify(metadata) : null]
+    );
+  } catch (err) {
+    logger.warn({ err }, `Erreur écriture audit log (${action}):`);
+  }
+}
+
+/** Le serveur exige-t-il le 2FA pour les actions de modération, et l'acteur l'a-t-il activé ? */
+async function checkModeration2FA(serverId: string, actorId: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  const db = getDb();
+  const [rows] = await db.query<RowDataPacket[]>(
+    'SELECT require_2fa_moderation FROM servers WHERE id = ?', [serverId]
+  );
+  if (!rows.length || !rows[0].require_2fa_moderation) return { ok: true };
+  const [userRows] = await db.query<RowDataPacket[]>(
+    'SELECT totp_enabled FROM users WHERE id = ?', [actorId]
+  );
+  if (userRows.length && userRows[0].totp_enabled) return { ok: true };
+  return { ok: false, error: 'Ce serveur exige la double authentification pour modérer — activez-la dans Connexion & 2FA.' };
+}
+
 interface ServerChannelParams {
   serverId: string;
   channelId: string;
@@ -273,8 +306,8 @@ serversRouter.post('/register',
       await db.transaction(async (conn) => {
         // Créer le serveur
         await conn.execute(
-          `INSERT INTO servers (id, name, description, owner_id, public_key, endpoint, port, max_members, is_online)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, TRUE)`,
+          `INSERT INTO servers (id, name, description, owner_id, public_key, endpoint, port, max_members, is_online, hosting_type)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, TRUE, 'self_hosted')`,
           [serverId, name, description, ownerId, publicKey, endpoint, port, maxMembers]
         );
 
@@ -413,6 +446,38 @@ serversRouter.get('/', authMiddleware, async (req: AuthRequest, res) => {
   }
 });
 
+// ============ QUOTA DE SERVEURS TYPE 1 (PLATEFORME) DE L'UTILISATEUR ============
+// Doit être déclarée avant /:serverId (sinon Express matche "quota" comme serverId).
+
+serversRouter.get('/quota', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const userId = req.userId!;
+    const db = getDb();
+    const [rows] = await db.query(
+      `SELECT category, COUNT(*) as count FROM servers
+       WHERE owner_id = ? AND hosting_type = 'platform' GROUP BY category`,
+      [userId]
+    );
+    const used = { standard: 0, community: 0 };
+    for (const row of rows as any[]) {
+      if (row.category === 'community') used.community = row.count;
+      else used.standard = row.count;
+    }
+    res.json({
+      limits: { total: PLATFORM_QUOTA.total, standard: PLATFORM_QUOTA.standard, community: PLATFORM_QUOTA.community },
+      used,
+      remaining: {
+        total: Math.max(0, PLATFORM_QUOTA.total - (used.standard + used.community)),
+        standard: Math.max(0, PLATFORM_QUOTA.standard - used.standard),
+        community: Math.max(0, PLATFORM_QUOTA.community - used.community),
+      },
+    });
+  } catch (error) {
+    logger.error('Erreur récupération quota serveurs:', error);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
 // ============ RÉCUPÉRER UN SERVEUR ============
 
 serversRouter.get('/:serverId', async (req, res) => {
@@ -459,6 +524,9 @@ serversRouter.get('/:serverId', async (req, res) => {
       bannerUrl: server.banner_url,
       ownerId: server.owner_id,
       isP2P: Boolean(server.is_p2p),
+      isPublic: Boolean(server.is_public),
+      hostingType: server.hosting_type || 'platform',
+      category: server.category || 'standard',
       maxMembers: server.max_members || 100,
       createdAt: server.created_at,
       updatedAt: server.updated_at,
@@ -521,6 +589,15 @@ serversRouter.post<ServerIdParams>('/:serverId/join',
       }
 
       const server = (servers as any[])[0];
+
+      // Refuser si l'utilisateur est banni de ce serveur
+      const [bans] = await db.query(
+        'SELECT 1 FROM server_bans WHERE server_id = ? AND user_id = ?',
+        [serverId, userId]
+      );
+      if ((bans as any[]).length > 0) {
+        return res.status(403).json({ error: 'Vous êtes banni de ce serveur' });
+      }
 
       // Vérifier si le serveur est public, en découverte approuvée, ou si l'utilisateur a un code d'invitation
       if (!server.is_public && !inviteCode) {
@@ -640,7 +717,7 @@ serversRouter.post<ServerIdParams>('/:serverId/channels',
   authMiddleware,
   body('name').isLength({ min: 1, max: 100 }),
   body('type').isIn(['text', 'voice', 'announcement', 'category', 'forum', 'stage', 'gallery', 'poll', 'suggestion', 'doc', 'counting', 'vent', 'thread', 'media', 'minigame', 'trivia']),
-  async (req, res) => {
+  async (req: AuthRequest, res) => {
     try {
       const errors = validationResult(req);
       if (!errors.isEmpty()) {
@@ -648,6 +725,11 @@ serversRouter.post<ServerIdParams>('/:serverId/channels',
       }
 
       const { serverId } = req.params;
+      const actorId = req.userId!;
+      if (!(await hasPermission(actorId, serverId, PERM.MANAGE_CHANNELS))) {
+        return res.status(403).json({ error: 'Permission insuffisante — MANAGE_CHANNELS requis' });
+      }
+
       const { name, type, parentId } = req.body;
       const db = getDb();
       const channelId = uuidv4();
@@ -673,6 +755,7 @@ serversRouter.post<ServerIdParams>('/:serverId/channels',
          VALUES (?, ?, ?, ?, ?, ?)`,
         [channelId, serverId, name, type, position, resolvedParentId]
       );
+      await logAudit(serverId, actorId, 'channel_create', { type: 'channel', id: channelId }, { name, channelType: type });
 
       res.status(201).json({
         id: channelId,
@@ -691,7 +774,12 @@ serversRouter.post<ServerIdParams>('/:serverId/channels',
 
 serversRouter.patch('/:serverId/channels/:channelId', authMiddleware, async (req: AuthRequest, res) => {
   try {
-    const { channelId } = req.params;
+    const { serverId, channelId } = req.params;
+    const actorId = req.userId!;
+    if (!(await hasPermission(actorId, serverId, PERM.MANAGE_CHANNELS))) {
+      return res.status(403).json({ error: 'Permission insuffisante — MANAGE_CHANNELS requis' });
+    }
+
     const { name, topic, position, isNsfw, slowMode, parentId } = req.body;
     const db = getDb();
 
@@ -708,6 +796,9 @@ serversRouter.patch('/:serverId/channels/:channelId', authMiddleware, async (req
     if (updates.length > 0) {
       params.push(channelId);
       await db.execute(`UPDATE channels SET ${updates.join(', ')} WHERE id = ?`, params);
+      if (name !== undefined) {
+        await logAudit(serverId, actorId, 'channel_update', { type: 'channel', id: channelId }, { name });
+      }
     }
 
     res.json({ success: true });
@@ -719,10 +810,15 @@ serversRouter.patch('/:serverId/channels/:channelId', authMiddleware, async (req
 
 serversRouter.delete('/:serverId/channels/:channelId', authMiddleware, async (req: AuthRequest, res) => {
   try {
-    const { channelId } = req.params;
-    const db = getDb();
+    const { serverId, channelId } = req.params;
+    const actorId = req.userId!;
+    if (!(await hasPermission(actorId, serverId, PERM.MANAGE_CHANNELS))) {
+      return res.status(403).json({ error: 'Permission insuffisante — MANAGE_CHANNELS requis' });
+    }
 
+    const db = getDb();
     await db.execute('DELETE FROM channels WHERE id = ?', [channelId]);
+    await logAudit(serverId, actorId, 'channel_delete', { type: 'channel', id: channelId });
 
     res.json({ success: true });
   } catch (error) {
@@ -739,7 +835,16 @@ serversRouter.post<ServerIdParams>('/:serverId/roles',
   async (req, res) => {
     try {
       const { serverId } = req.params;
-      const { name, color = '#99AAB5', permissions = [] } = req.body;
+      const actorId = (req as AuthRequest).userId!;
+
+      // Vérifier la permission MANAGE_ROLES
+      if (!(await hasPermission(actorId, serverId, PERM.MANAGE_ROLES))) {
+        return res.status(403).json({ error: 'Permission insuffisante — MANAGE_ROLES requis' });
+      }
+
+      const { name, color = '#99AAB5', permissions = 0 } = req.body;
+      // Masquer les permissions à la plage valide — jamais stocker la valeur brute du client
+      const safePermissions = (Number(permissions) || 0) & PERM.ALL;
       const db = getDb();
       const roleId = uuidv4();
 
@@ -752,10 +857,11 @@ serversRouter.post<ServerIdParams>('/:serverId/roles',
       await db.execute(
         `INSERT INTO roles (id, server_id, name, color, position, permissions)
          VALUES (?, ?, ?, ?, ?, ?)`,
-        [roleId, serverId, name, color, position, JSON.stringify(permissions)]
+        [roleId, serverId, name, color, position, JSON.stringify(safePermissions)]
       );
+      await logAudit(serverId, actorId, 'role_create', { type: 'role', id: roleId }, { name });
 
-      res.status(201).json({ id: roleId, name, color, position, permissions });
+      res.status(201).json({ id: roleId, name, color, position, permissions: safePermissions });
     } catch (error) {
       logger.error('Erreur création rôle:', error);
       res.status(500).json({ error: 'Erreur serveur' });
@@ -765,17 +871,52 @@ serversRouter.post<ServerIdParams>('/:serverId/roles',
 
 // ============ CRÉER UN SERVEUR (interface frontend — sans endpoint requis) ============
 
+// Plafonds de membres et quotas par utilisateur pour les serveurs Type 1
+// (hébergés à 100% par AlfyChat). cf. plan de refonte du système de serveurs.
+const PLATFORM_MAX_MEMBERS: Record<'standard' | 'community', number> = {
+  standard: 200,
+  community: 4000,
+};
+const PLATFORM_QUOTA = { total: 5, community: 2, standard: 3 } as const;
+
 serversRouter.post('/',
   authMiddleware,
   body('name').isLength({ min: 2, max: 100 }),
+  body('category').optional().isIn(['standard', 'community']),
   async (req: AuthRequest, res) => {
     try {
       const errors = validationResult(req);
       if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
       const { name, description, iconUrl, bannerUrl, isPublic = false } = req.body;
+      const category: 'standard' | 'community' = req.body.category === 'community' ? 'community' : 'standard';
       const ownerId = req.userId!;
       const db = getDb();
+
+      // Quota Type 1 : max 5 serveurs plateforme par utilisateur, dont max 2
+      // communautaires et max 3 standard.
+      const [ownedRows] = await db.query(
+        `SELECT category, COUNT(*) as count FROM servers
+         WHERE owner_id = ? AND hosting_type = 'platform' GROUP BY category`,
+        [ownerId]
+      );
+      const owned = { standard: 0, community: 0 };
+      for (const row of ownedRows as any[]) {
+        if (row.category === 'community') owned.community = row.count;
+        else owned.standard = row.count;
+      }
+      const totalOwned = owned.standard + owned.community;
+      if (totalOwned >= PLATFORM_QUOTA.total) {
+        return res.status(403).json({ error: `Limite de ${PLATFORM_QUOTA.total} serveurs atteinte` });
+      }
+      if (category === 'community' && owned.community >= PLATFORM_QUOTA.community) {
+        return res.status(403).json({ error: `Limite de ${PLATFORM_QUOTA.community} serveurs communautaires atteinte` });
+      }
+      if (category === 'standard' && owned.standard >= PLATFORM_QUOTA.standard) {
+        return res.status(403).json({ error: `Limite de ${PLATFORM_QUOTA.standard} serveurs standard atteinte` });
+      }
+
+      const maxMembers = PLATFORM_MAX_MEMBERS[category];
       const serverId = uuidv4();
       const nodeToken = uuidv4();
       const defaultRoleId = uuidv4();
@@ -784,9 +925,9 @@ serversRouter.post('/',
 
       await db.transaction(async (conn) => {
         await conn.execute(
-          `INSERT INTO servers (id, name, description, icon_url, banner_url, owner_id, public_key, endpoint, port, is_public, node_token)
-           VALUES (?, ?, ?, ?, ?, ?, '', '', 0, ?, ?)`,
-          [serverId, name, description || null, iconUrl || null, bannerUrl || null, ownerId, isPublic, nodeToken]
+          `INSERT INTO servers (id, name, description, icon_url, banner_url, owner_id, public_key, endpoint, port, is_public, node_token, hosting_type, category, max_members)
+           VALUES (?, ?, ?, ?, ?, ?, '', '', 0, ?, ?, 'platform', ?, ?)`,
+          [serverId, name, description || null, iconUrl || null, bannerUrl || null, ownerId, isPublic, nodeToken, category, maxMembers]
         );
         await conn.execute(
           `INSERT INTO roles (id, server_id, name, color, is_default, position, permissions)
@@ -818,6 +959,9 @@ serversRouter.post('/',
         ownerId,
         nodeToken,
         isPublic,
+        hostingType: 'platform',
+        category,
+        maxMembers,
         channels: [
           { id: generalChannelId, name: 'général', type: 'text' },
           { id: voiceChannelId, name: 'Vocal', type: 'voice' },
@@ -842,7 +986,7 @@ serversRouter.patch<ServerIdParams>('/:serverId', authMiddleware, async (req: Au
       return res.status(403).json({ error: 'Permission insuffisante — ADMIN requis' });
     }
 
-    const { name, description, iconUrl, bannerUrl, isPublic } = req.body;
+    const { name, description, iconUrl, bannerUrl, isPublic, category, verificationLevel, require2faModeration, restrictEmojiUsage } = req.body;
     const db = getDb();
 
     const updates: string[] = [];
@@ -853,10 +997,70 @@ serversRouter.patch<ServerIdParams>('/:serverId', authMiddleware, async (req: Au
     if (iconUrl !== undefined) { updates.push('icon_url = ?'); params.push(iconUrl); }
     if (bannerUrl !== undefined) { updates.push('banner_url = ?'); params.push(bannerUrl); }
     if (isPublic !== undefined) { updates.push('is_public = ?'); params.push(isPublic); }
+    if (verificationLevel !== undefined) {
+      if (!['none', 'low', 'medium', 'high'].includes(verificationLevel)) {
+        return res.status(400).json({ error: 'Niveau de vérification invalide' });
+      }
+      updates.push('verification_level = ?'); params.push(verificationLevel);
+    }
+    if (require2faModeration !== undefined) {
+      updates.push('require_2fa_moderation = ?'); params.push(Boolean(require2faModeration));
+    }
+    if (restrictEmojiUsage !== undefined) {
+      updates.push('restrict_emoji_usage = ?'); params.push(Boolean(restrictEmojiUsage));
+    }
+
+    // Changement d'état Type 1 (standard ↔ communautaire) : redimensionne
+    // max_members et repasse par le même quota que la création, en excluant
+    // ce serveur-ci de son propre décompte.
+    if (category !== undefined) {
+      if (category !== 'standard' && category !== 'community') {
+        return res.status(400).json({ error: 'Catégorie invalide' });
+      }
+      const [rows] = await db.query('SELECT owner_id, hosting_type, category FROM servers WHERE id = ?', [serverId]);
+      const current = (rows as any[])[0];
+      if (!current) return res.status(404).json({ error: 'Serveur non trouvé' });
+      if (current.hosting_type !== 'platform') {
+        return res.status(400).json({ error: 'La catégorie ne concerne que les serveurs hébergés par AlfyChat' });
+      }
+      if (category !== current.category) {
+        const [countRows] = await db.query(
+          `SELECT category, COUNT(*) as count FROM servers
+           WHERE owner_id = ? AND hosting_type = 'platform' AND id != ? GROUP BY category`,
+          [current.owner_id, serverId]
+        );
+        const others = { standard: 0, community: 0 };
+        for (const row of countRows as any[]) {
+          if (row.category === 'community') others.community = row.count;
+          else others.standard = row.count;
+        }
+        if (others.standard + others.community + 1 > PLATFORM_QUOTA.total) {
+          return res.status(403).json({ error: `Limite de ${PLATFORM_QUOTA.total} serveurs atteinte` });
+        }
+        if (category === 'community' && others.community + 1 > PLATFORM_QUOTA.community) {
+          return res.status(403).json({ error: `Limite de ${PLATFORM_QUOTA.community} serveurs communautaires atteinte` });
+        }
+        if (category === 'standard' && others.standard + 1 > PLATFORM_QUOTA.standard) {
+          return res.status(403).json({ error: `Limite de ${PLATFORM_QUOTA.standard} serveurs standard atteinte` });
+        }
+
+        const newMax = PLATFORM_MAX_MEMBERS[category as 'standard' | 'community'];
+        const [memberCountRows] = await db.query(
+          'SELECT COUNT(*) as count FROM server_members WHERE server_id = ?',
+          [serverId]
+        );
+        if ((memberCountRows as any[])[0].count > newMax) {
+          return res.status(400).json({ error: `Ce serveur a plus de ${newMax} membres — passage impossible vers cette catégorie` });
+        }
+        updates.push('category = ?'); params.push(category);
+        updates.push('max_members = ?'); params.push(newMax);
+      }
+    }
 
     if (updates.length > 0) {
       params.push(serverId);
       await db.execute(`UPDATE servers SET ${updates.join(', ')} WHERE id = ?`, params);
+      await logAudit(serverId, userId, 'server_update', { type: 'server', id: serverId }, { fields: Object.keys(req.body) });
     }
 
     res.json({ success: true });
@@ -916,6 +1120,7 @@ serversRouter.get('/:serverId/members/:userId/check', async (req, res) => {
 serversRouter.get<ServerIdParams>('/:serverId/members', async (req, res) => {
   try {
     const { serverId } = req.params;
+    const showBanned = req.query.showBanned === 'true';
     const db = getDb();
 
     const [members] = await db.query(
@@ -940,9 +1145,29 @@ serversRouter.get<ServerIdParams>('/:serverId/members', async (req, res) => {
       joinedAt: m.joined_at,
       isMuted: Boolean(m.is_muted),
       isDeafened: Boolean(m.is_deafened),
+      isBanned: false,
     }));
 
-    res.json(mapped);
+    if (!showBanned) return res.json(mapped);
+
+    const [bans] = await db.query(
+      `SELECT sb.user_id, sb.reason, u.username, u.display_name, u.avatar_url
+       FROM server_bans sb
+       LEFT JOIN users u ON sb.user_id = u.id
+       WHERE sb.server_id = ?`,
+      [serverId]
+    );
+    const bannedMapped = (bans as any[]).map((b: any) => ({
+      userId: b.user_id,
+      serverId,
+      username: b.username,
+      displayName: b.display_name,
+      avatarUrl: b.avatar_url,
+      isBanned: true,
+      banReason: b.reason,
+    }));
+
+    res.json([...mapped, ...bannedMapped]);
   } catch (error) {
     logger.error('Erreur récupération membres:', error);
     res.status(500).json({ error: 'Erreur serveur' });
@@ -957,8 +1182,9 @@ serversRouter.patch('/:serverId/members/:userId', authMiddleware, async (req: Au
     const { roleIds, nickname } = req.body;
 
     // Modifier son propre nickname ne requiert pas de permission spéciale
-    // Modifier les rôles d'un autre nécessite ADMIN
-    if (roleIds !== undefined && actorId !== userId) {
+    // Modifier des rôles (les siens ou ceux d'un autre) nécessite toujours ADMIN —
+    // sans quoi un membre pourrait s'auto-attribuer un rôle plus élevé
+    if (roleIds !== undefined) {
       if (!(await hasPermission(actorId, serverId, PERM.ADMIN))) {
         return res.status(403).json({ error: 'Permission insuffisante — ADMIN requis pour modifier les rôles' });
       }
@@ -994,9 +1220,91 @@ serversRouter.patch('/:serverId/members/:userId', authMiddleware, async (req: Au
       `UPDATE server_members SET ${updates.join(', ')} WHERE server_id = ? AND user_id = ?`,
       params
     );
+    if (roleIds !== undefined) {
+      await logAudit(serverId, actorId, 'member_role_update', { type: 'user', id: userId }, { roleIds });
+    }
     res.json({ success: true });
   } catch (error) {
     logger.error('Erreur modification membre:', error);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// Expulser un membre (fallback quand aucun server-node n'est connecté)
+serversRouter.post('/:serverId/members/:userId/kick', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const { serverId, userId } = req.params;
+    const actorId = req.userId!;
+
+    if (actorId === userId) return res.status(400).json({ error: 'Impossible de vous expulser vous-même' });
+    if (!(await hasPermission(actorId, serverId, PERM.KICK))) {
+      return res.status(403).json({ error: 'Permission insuffisante — KICK requis' });
+    }
+    if (await isOwner(userId, serverId)) {
+      return res.status(403).json({ error: 'Impossible d\'expulser le propriétaire' });
+    }
+    const twoFa = await checkModeration2FA(serverId, actorId);
+    if (!twoFa.ok) return res.status(403).json({ error: twoFa.error });
+
+    const db = getDb();
+    await db.execute('DELETE FROM server_members WHERE server_id = ? AND user_id = ?', [serverId, userId]);
+    await logAudit(serverId, actorId, 'member_kick', { type: 'user', id: userId });
+    res.json({ success: true });
+  } catch (error) {
+    logger.error('Erreur expulsion membre:', error);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// Bannir un membre (fallback quand aucun server-node n'est connecté)
+serversRouter.post('/:serverId/members/:userId/ban', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const { serverId, userId } = req.params;
+    const actorId = req.userId!;
+    const { reason } = req.body;
+
+    if (actorId === userId) return res.status(400).json({ error: 'Impossible de vous bannir vous-même' });
+    if (!(await hasPermission(actorId, serverId, PERM.BAN))) {
+      return res.status(403).json({ error: 'Permission insuffisante — BAN requis' });
+    }
+    if (await isOwner(userId, serverId)) {
+      return res.status(403).json({ error: 'Impossible de bannir le propriétaire' });
+    }
+    const twoFa = await checkModeration2FA(serverId, actorId);
+    if (!twoFa.ok) return res.status(403).json({ error: twoFa.error });
+
+    const db = getDb();
+    await db.execute(
+      `INSERT INTO server_bans (server_id, user_id, reason, banned_by)
+       VALUES (?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE reason = VALUES(reason), banned_by = VALUES(banned_by), banned_at = CURRENT_TIMESTAMP`,
+      [serverId, userId, reason || null, actorId]
+    );
+    await db.execute('DELETE FROM server_members WHERE server_id = ? AND user_id = ?', [serverId, userId]);
+    await logAudit(serverId, actorId, 'member_ban', { type: 'user', id: userId }, { reason: reason || null });
+    res.json({ success: true });
+  } catch (error) {
+    logger.error('Erreur bannissement membre:', error);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// Révoquer un bannissement
+serversRouter.delete('/:serverId/members/:userId/ban', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const { serverId, userId } = req.params;
+    const actorId = req.userId!;
+
+    if (!(await hasPermission(actorId, serverId, PERM.BAN))) {
+      return res.status(403).json({ error: 'Permission insuffisante — BAN requis' });
+    }
+
+    const db = getDb();
+    await db.execute('DELETE FROM server_bans WHERE server_id = ? AND user_id = ?', [serverId, userId]);
+    await logAudit(serverId, actorId, 'member_unban', { type: 'user', id: userId });
+    res.json({ success: true });
+  } catch (error) {
+    logger.error('Erreur révocation bannissement:', error);
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
@@ -1057,6 +1365,7 @@ serversRouter.patch('/:serverId/roles/:roleId', authMiddleware, async (req, res)
     if (updates.length > 0) {
       params.push(roleId);
       await db.execute(`UPDATE roles SET ${updates.join(', ')} WHERE id = ?`, params);
+      await logAudit(serverId, actorId, 'role_update', { type: 'role', id: roleId }, { fields: Object.keys(req.body) });
     }
 
     res.json({ success: true });
@@ -1078,6 +1387,7 @@ serversRouter.delete('/:serverId/roles/:roleId', authMiddleware, async (req, res
 
     const db = getDb();
     await db.execute('DELETE FROM roles WHERE id = ? AND is_default = FALSE', [roleId]);
+    await logAudit(serverId, actorId, 'role_delete', { type: 'role', id: roleId });
     res.json({ success: true });
   } catch (error) {
     logger.error('Erreur suppression rôle:', error);
@@ -1245,6 +1555,15 @@ serversRouter.post('/join',
       const server = (servers as any[])[0];
 
       if (userId) {
+        // Refuser si l'utilisateur est banni de ce serveur
+        const [bans] = await db.query(
+          'SELECT 1 FROM server_bans WHERE server_id = ? AND user_id = ?',
+          [serverId, userId]
+        );
+        if ((bans as any[]).length > 0) {
+          return res.status(403).json({ error: 'Vous êtes banni de ce serveur' });
+        }
+
         // Vérifier si déjà membre
         const [existing] = await db.query(
           'SELECT * FROM server_members WHERE server_id = ? AND user_id = ?',
@@ -1252,6 +1571,17 @@ serversRouter.post('/join',
         );
 
         if ((existing as any[]).length === 0) {
+          // Plafond de membres — même check que POST /:serverId/join, absent
+          // ici jusqu'ici alors que c'est le chemin de jointure dominant
+          // (dialogue "Rejoindre", embed d'invitation, page /invite/[code]).
+          const [memberCount] = await db.query(
+            'SELECT COUNT(*) as count FROM server_members WHERE server_id = ?',
+            [serverId]
+          );
+          if ((memberCount as any[])[0].count >= (server.max_members || 100)) {
+            return res.status(403).json({ error: 'Le serveur est plein' });
+          }
+
           // Récupérer le rôle par défaut
           const [defaultRole] = await db.query(
             'SELECT id FROM roles WHERE server_id = ? AND is_default = TRUE',
@@ -1396,13 +1726,14 @@ serversRouter.get<ServerChannelParams>('/:serverId/channels/:channelId/messages'
       channelId: msg.channel_id,
       serverId: msg.server_id,
       senderId: msg.sender_id,
-      senderName: msg.display_name || msg.username,
-      senderAvatar: msg.avatar_url,
+      senderName: msg.display_name || msg.username || msg.webhook_name,
+      senderAvatar: msg.avatar_url || msg.webhook_avatar_url,
+      isWebhook: !msg.sender_id && !!msg.webhook_id,
       sender: {
         id: msg.sender_id,
-        username: msg.username || 'Utilisateur',
-        displayName: msg.display_name || msg.username || undefined,
-        avatarUrl: msg.avatar_url || undefined,
+        username: msg.username || msg.webhook_name || 'Webhook',
+        displayName: msg.display_name || msg.username || msg.webhook_name || undefined,
+        avatarUrl: msg.avatar_url || msg.webhook_avatar_url || undefined,
       },
       content: msg.content,
       attachments: msg.attachments ? JSON.parse(msg.attachments) : [],
@@ -1668,7 +1999,7 @@ serversRouter.post('/nodes/register', authMiddleware, async (req: AuthRequest, r
 
     await db.transaction(async (conn) => {
       await conn.execute(
-        `INSERT INTO servers (id, name, node_token, is_public) VALUES (?, ?, ?, FALSE)`,
+        `INSERT INTO servers (id, name, node_token, is_public, hosting_type) VALUES (?, ?, ?, FALSE, 'self_hosted')`,
         [serverId, serverName, nodeToken]
       );
       await conn.execute(
@@ -2652,6 +2983,285 @@ serversRouter.post('/:serverId/stage/:channelId/leave',
   }
 );
 
+// ============ ÉMOJI PERSONNALISÉS ============
+
+// Émoji utilisables PAR L'UTILISATEUR COURANT dans n'importe quel salon (DM,
+// groupe, autre serveur) : ceux de tous les serveurs dont il est membre, sauf
+// ceux dont le serveur d'origine restreint l'usage à lui-même — dans ce cas
+// on ne les inclut que si `currentServerId` correspond (usage local toujours
+// permis). Doit être déclarée avant /:serverId/emojis (segment "available"
+// vs :serverId littéral "available" — sans risque ici, mais gardé cohérent
+// avec le reste du fichier).
+serversRouter.get('/emojis/available', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const userId = req.userId!;
+    const currentServerId = (req.query.currentServerId as string | undefined) || null;
+    const db = getDb();
+    const [rows] = await db.query(
+      `SELECT se.*, s.restrict_emoji_usage
+       FROM server_emojis se
+       JOIN servers s ON se.server_id = s.id
+       JOIN server_members sm ON sm.server_id = s.id AND sm.user_id = ?
+       WHERE s.restrict_emoji_usage = FALSE OR s.id = ?
+       ORDER BY se.created_at DESC`,
+      [userId, currentServerId]
+    );
+    res.json((rows as any[]).map((e) => ({
+      id: e.id, serverId: e.server_id, name: e.name, imageUrl: e.image_url, animated: Boolean(e.animated),
+    })));
+  } catch (error) {
+    logger.error('Erreur récupération émojis disponibles:', error);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+serversRouter.get('/:serverId/emojis', async (req, res) => {
+  try {
+    const { serverId } = req.params;
+    const db = getDb();
+    const [rows] = await db.query(
+      'SELECT * FROM server_emojis WHERE server_id = ? ORDER BY created_at DESC',
+      [serverId]
+    );
+    res.json((rows as any[]).map((e) => ({
+      id: e.id, serverId: e.server_id, name: e.name, imageUrl: e.image_url,
+      animated: Boolean(e.animated), creatorId: e.creator_id, createdAt: e.created_at,
+    })));
+  } catch (error) {
+    logger.error('Erreur récupération émojis:', error);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+serversRouter.post('/:serverId/emojis',
+  authMiddleware,
+  body('name').isString().isLength({ min: 2, max: 32 }).matches(/^[a-zA-Z0-9_]+$/),
+  body('imageUrl').isString().isLength({ min: 1 }),
+  async (req: AuthRequest, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ error: 'Nom invalide (lettres/chiffres/_ uniquement)' });
+
+      const { serverId } = req.params;
+      const actorId = req.userId!;
+      if (!(await hasPermission(actorId, serverId, PERM.MANAGE_CHANNELS))) {
+        return res.status(403).json({ error: 'Permission insuffisante — MANAGE_CHANNELS requis' });
+      }
+
+      const [countRows] = await getDb().query('SELECT COUNT(*) as count FROM server_emojis WHERE server_id = ?', [serverId]);
+      if ((countRows as any[])[0].count >= 50) {
+        return res.status(403).json({ error: 'Limite de 50 émojis personnalisés atteinte' });
+      }
+
+      const { name, imageUrl, animated = false } = req.body;
+      const emojiId = uuidv4();
+      const db = getDb();
+      try {
+        await db.execute(
+          'INSERT INTO server_emojis (id, server_id, name, image_url, animated, creator_id) VALUES (?, ?, ?, ?, ?, ?)',
+          [emojiId, serverId, name, imageUrl, Boolean(animated), actorId]
+        );
+      } catch (err: any) {
+        if (err.code === 'ER_DUP_ENTRY') return res.status(409).json({ error: 'Un émoji porte déjà ce nom sur ce serveur' });
+        throw err;
+      }
+      await logAudit(serverId, actorId, 'emoji_create', { type: 'emoji', id: emojiId }, { name });
+      res.status(201).json({ id: emojiId, serverId, name, imageUrl, animated: Boolean(animated), creatorId: actorId });
+    } catch (error) {
+      logger.error('Erreur création émoji:', error);
+      res.status(500).json({ error: 'Erreur serveur' });
+    }
+  }
+);
+
+serversRouter.delete('/:serverId/emojis/:emojiId', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const { serverId, emojiId } = req.params;
+    const actorId = req.userId!;
+    if (!(await hasPermission(actorId, serverId, PERM.MANAGE_CHANNELS))) {
+      return res.status(403).json({ error: 'Permission insuffisante — MANAGE_CHANNELS requis' });
+    }
+    const db = getDb();
+    await db.execute('DELETE FROM server_emojis WHERE id = ? AND server_id = ?', [emojiId, serverId]);
+    await logAudit(serverId, actorId, 'emoji_delete', { type: 'emoji', id: emojiId });
+    res.json({ success: true });
+  } catch (error) {
+    logger.error('Erreur suppression émoji:', error);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// ============ JOURNAL D'AUDIT ============
+
+serversRouter.get('/:serverId/audit-logs', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const { serverId } = req.params;
+    const actorId = req.userId!;
+    if (!(await hasPermission(actorId, serverId, PERM.ADMIN))) {
+      return res.status(403).json({ error: 'Permission insuffisante — ADMIN requis' });
+    }
+    const limit = Math.min(Number(req.query.limit) || 50, 100);
+    const offset = Math.max(Number(req.query.offset) || 0, 0);
+    const db = getDb();
+    const [rows] = await db.query(
+      `SELECT al.*, u.username, u.display_name, u.avatar_url
+       FROM audit_logs al
+       LEFT JOIN users u ON al.actor_id = u.id
+       WHERE al.server_id = ?
+       ORDER BY al.created_at DESC
+       LIMIT ? OFFSET ?`,
+      [serverId, limit, offset]
+    );
+    res.json((rows as any[]).map((r) => ({
+      id: r.id,
+      action: r.action,
+      targetType: r.target_type,
+      targetId: r.target_id,
+      metadata: r.metadata ? (typeof r.metadata === 'string' ? JSON.parse(r.metadata) : r.metadata) : null,
+      createdAt: r.created_at,
+      actor: {
+        id: r.actor_id,
+        username: r.username || 'Utilisateur',
+        displayName: r.display_name || r.username || undefined,
+        avatarUrl: r.avatar_url || undefined,
+      },
+    })));
+  } catch (error) {
+    logger.error('Erreur récupération journal d\'audit:', error);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// ============ SÉCURITÉ ============
+
+serversRouter.get('/:serverId/security', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const { serverId } = req.params;
+    if (!(await hasPermission(req.userId!, serverId, PERM.ADMIN))) {
+      return res.status(403).json({ error: 'Permission insuffisante — ADMIN requis' });
+    }
+    const [rows] = await getDb().query<RowDataPacket[]>(
+      'SELECT verification_level, require_2fa_moderation, restrict_emoji_usage FROM servers WHERE id = ?',
+      [serverId]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'Serveur non trouvé' });
+    res.json({
+      verificationLevel: rows[0].verification_level,
+      require2faModeration: Boolean(rows[0].require_2fa_moderation),
+      restrictEmojiUsage: Boolean(rows[0].restrict_emoji_usage),
+    });
+  } catch (error) {
+    logger.error('Erreur récupération config sécurité:', error);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// ============ WEBHOOKS (INTÉGRATIONS) ============
+
+serversRouter.get('/:serverId/webhooks', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const { serverId } = req.params;
+    if (!(await hasPermission(req.userId!, serverId, PERM.MANAGE_CHANNELS))) {
+      return res.status(403).json({ error: 'Permission insuffisante — MANAGE_CHANNELS requis' });
+    }
+    const db = getDb();
+    const [rows] = await db.query(
+      'SELECT * FROM server_webhooks WHERE server_id = ? ORDER BY created_at DESC',
+      [serverId]
+    );
+    res.json((rows as any[]).map((w) => ({
+      id: w.id, serverId: w.server_id, channelId: w.channel_id, name: w.name,
+      avatarUrl: w.avatar_url, token: w.token, creatorId: w.creator_id, createdAt: w.created_at,
+    })));
+  } catch (error) {
+    logger.error('Erreur récupération webhooks:', error);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+serversRouter.post('/:serverId/channels/:channelId/webhooks',
+  authMiddleware,
+  body('name').isString().isLength({ min: 1, max: 80 }),
+  async (req: AuthRequest, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ error: 'Nom invalide' });
+
+      const { serverId, channelId } = req.params;
+      const actorId = req.userId!;
+      if (!(await hasPermission(actorId, serverId, PERM.MANAGE_CHANNELS))) {
+        return res.status(403).json({ error: 'Permission insuffisante — MANAGE_CHANNELS requis' });
+      }
+
+      const { name, avatarUrl } = req.body;
+      const webhookId = uuidv4();
+      const token = crypto.randomBytes(32).toString('hex');
+      const db = getDb();
+      await db.execute(
+        'INSERT INTO server_webhooks (id, server_id, channel_id, name, avatar_url, token, creator_id) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        [webhookId, serverId, channelId, name, avatarUrl || null, token, actorId]
+      );
+      await logAudit(serverId, actorId, 'webhook_create', { type: 'webhook', id: webhookId }, { name, channelId });
+      res.status(201).json({ id: webhookId, serverId, channelId, name, avatarUrl: avatarUrl || null, token, creatorId: actorId });
+    } catch (error) {
+      logger.error('Erreur création webhook:', error);
+      res.status(500).json({ error: 'Erreur serveur' });
+    }
+  }
+);
+
+serversRouter.delete('/:serverId/webhooks/:webhookId', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const { serverId, webhookId } = req.params;
+    const actorId = req.userId!;
+    if (!(await hasPermission(actorId, serverId, PERM.MANAGE_CHANNELS))) {
+      return res.status(403).json({ error: 'Permission insuffisante — MANAGE_CHANNELS requis' });
+    }
+    const db = getDb();
+    await db.execute('DELETE FROM server_webhooks WHERE id = ? AND server_id = ?', [webhookId, serverId]);
+    await logAudit(serverId, actorId, 'webhook_delete', { type: 'webhook', id: webhookId });
+    res.json({ success: true });
+  } catch (error) {
+    logger.error('Erreur suppression webhook:', error);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// Endpoint public (pas d'authMiddleware — le token DANS l'URL est le secret,
+// comme les webhooks Discord) : poste un message au nom du webhook. Le
+// message est bien persisté et relu au prochain chargement du salon ; sans
+// diffusion temps réel (le webhook ne passe pas par le gateway/socket).
+serversRouter.post('/webhooks/:webhookId/:token',
+  body('content').isString().isLength({ min: 1, max: 4000 }),
+  async (req, res) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ error: 'Contenu invalide' });
+
+      const { webhookId, token } = req.params;
+      const db = getDb();
+      const [rows] = await db.query<RowDataPacket[]>(
+        'SELECT * FROM server_webhooks WHERE id = ? AND token = ?',
+        [webhookId, token]
+      );
+      if (!rows.length) return res.status(401).json({ error: 'Webhook invalide' });
+      const webhook = rows[0];
+
+      const { content, username, avatarUrl } = req.body;
+      const messageId = uuidv4();
+      await db.execute(
+        `INSERT INTO server_messages (id, channel_id, server_id, content, webhook_id, webhook_name, webhook_avatar_url)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [messageId, webhook.channel_id, webhook.server_id, content, webhookId, (username || webhook.name).slice(0, 80), avatarUrl || webhook.avatar_url || null]
+      );
+      res.status(201).json({ id: messageId, channelId: webhook.channel_id, serverId: webhook.server_id, content });
+    } catch (error) {
+      logger.error('Erreur envoi message webhook:', error);
+      res.status(500).json({ error: 'Erreur serveur' });
+    }
+  }
+);
+
 async function cleanupOfflineServers() {
   const cutoff = Date.now() - 60000; // 1 minute sans ping
   const offlineServers = await redis.zrangebyscore('servers:online', '-inf', cutoff);
@@ -2879,6 +3489,15 @@ async function start() {
         PRIMARY KEY (server_id, user_id)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
 
+      `CREATE TABLE IF NOT EXISTS server_bans (
+        server_id VARCHAR(36) NOT NULL,
+        user_id VARCHAR(36) NOT NULL,
+        reason VARCHAR(500) NULL,
+        banned_by VARCHAR(36) NOT NULL,
+        banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (server_id, user_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+
       `CREATE TABLE IF NOT EXISTS server_invites (
         id VARCHAR(36) PRIMARY KEY,
         server_id VARCHAR(36) NOT NULL,
@@ -2978,6 +3597,32 @@ async function start() {
       `ALTER TABLE servers ADD COLUMN is_certified BOOLEAN DEFAULT FALSE`,
       `ALTER TABLE servers ADD COLUMN is_partnered BOOLEAN DEFAULT FALSE`,
 
+      // Type d'hébergement (Type 1 plateforme / Type 2 auto-hébergé / Type 3 hébergeur certifié)
+      // + catégorie Type 1 (standard 200 membres / communautaire 4000 membres)
+      `ALTER TABLE servers ADD COLUMN hosting_type ENUM('platform','self_hosted','certified_host') NOT NULL DEFAULT 'platform'`,
+      `ALTER TABLE servers ADD COLUMN category ENUM('standard','community') NOT NULL DEFAULT 'standard'`,
+      // Backfill : les serveurs déjà enregistrés avec un endpoint réel (posé par
+      // l'ancien POST /register direct) sont en réalité de type self_hosted, pas
+      // platform (défaut de la colonne). ATTENTION : node_token n'est PAS un
+      // signal fiable ici — POST / (création normale, plateforme) en pose un
+      // aussi pour tout le monde ; l'utiliser a fait basculer À TORT tous les
+      // serveurs plateforme en self_hosted à chaque redémarrage du service
+      // (chaque UPDATE de cette liste est ré-exécuté au boot), cassant le
+      // changement de catégorie. Seul un endpoint non vide distingue vraiment
+      // l'ancien chemin self-hosted direct.
+      `UPDATE servers SET hosting_type = 'self_hosted' WHERE hosting_type = 'platform' AND endpoint IS NOT NULL AND endpoint != ''`,
+      // Correctif rétroactif de la bascule erronée ci-dessus (déjà exécutée sur
+      // des runs précédents avant ce correctif) : seul POST / insère un endpoint
+      // valant la chaîne vide '' (les serveurs /nodes/register laissent endpoint
+      // NULL) — signature fiable pour revenir en arrière sans jamais retoucher
+      // un vrai serveur self-hosted.
+      `UPDATE servers SET hosting_type = 'platform' WHERE hosting_type = 'self_hosted' AND endpoint = ''`,
+      // Backfill : les serveurs plateforme existants n'avaient pas de catégorie —
+      // on les fait passer au nouveau plafond standard (200) uniquement s'ils
+      // sont restés sur l'ancien défaut jamais personnalisé (100), pour ne pas
+      // écraser un max_members custom fixé via l'ancien POST /register.
+      `UPDATE servers SET max_members = 200 WHERE hosting_type = 'platform' AND category = 'standard' AND max_members = 100`,
+
       // Table des candidatures de découverte
       `CREATE TABLE IF NOT EXISTS server_applications (
         id VARCHAR(36) PRIMARY KEY,
@@ -3076,6 +3721,61 @@ async function start() {
         started_by VARCHAR(36) NULL,
         INDEX idx_server_stage (server_id)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+
+      // ======================================================
+      // ÉMOJI PERSONNALISÉS / JOURNAL D'AUDIT / SÉCURITÉ / WEBHOOKS
+      // ======================================================
+
+      `CREATE TABLE IF NOT EXISTS server_emojis (
+        id VARCHAR(36) PRIMARY KEY,
+        server_id VARCHAR(36) NOT NULL,
+        name VARCHAR(64) NOT NULL,
+        image_url VARCHAR(500) NOT NULL,
+        animated BOOLEAN DEFAULT FALSE,
+        creator_id VARCHAR(36) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY unique_emoji_name (server_id, name),
+        INDEX idx_server_emojis (server_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+
+      `CREATE TABLE IF NOT EXISTS audit_logs (
+        id VARCHAR(36) PRIMARY KEY,
+        server_id VARCHAR(36) NOT NULL,
+        actor_id VARCHAR(36) NOT NULL,
+        action VARCHAR(50) NOT NULL,
+        target_type VARCHAR(30) NULL,
+        target_id VARCHAR(36) NULL,
+        metadata JSON NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_server_audit (server_id, created_at)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+
+      `CREATE TABLE IF NOT EXISTS server_webhooks (
+        id VARCHAR(36) PRIMARY KEY,
+        server_id VARCHAR(36) NOT NULL,
+        channel_id VARCHAR(36) NOT NULL,
+        name VARCHAR(80) NOT NULL,
+        avatar_url VARCHAR(500) NULL,
+        token VARCHAR(64) NOT NULL,
+        creator_id VARCHAR(36) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY unique_webhook_token (token),
+        INDEX idx_server_webhooks (server_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+
+      // Config sécurité — verification_level existe déjà ; ajoute l'exigence 2FA modération.
+      `ALTER TABLE servers ADD COLUMN require_2fa_moderation BOOLEAN DEFAULT FALSE`,
+      // Si vrai, les émoji personnalisés de ce serveur ne sont utilisables que
+      // dans ses propres salons — sinon utilisables partout où l'utilisateur
+      // est membre (comme les émoji Discord Nitro).
+      `ALTER TABLE servers ADD COLUMN restrict_emoji_usage BOOLEAN DEFAULT FALSE`,
+
+      // Messages envoyés par un webhook : pas de sender_id réel (aucun compte
+      // utilisateur), identité affichée portée par ces colonnes à la place.
+      `ALTER TABLE server_messages MODIFY COLUMN sender_id VARCHAR(36) NULL`,
+      `ALTER TABLE server_messages ADD COLUMN webhook_id VARCHAR(36) NULL`,
+      `ALTER TABLE server_messages ADD COLUMN webhook_name VARCHAR(80) NULL`,
+      `ALTER TABLE server_messages ADD COLUMN webhook_avatar_url VARCHAR(500) NULL`,
     ];
 
     for (const sql of migrations) {
