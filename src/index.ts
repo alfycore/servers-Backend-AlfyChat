@@ -89,80 +89,36 @@ async function adminMiddleware(req: AuthRequest, res: Response, next: NextFuncti
   }
 }
 
-interface ServerIdParams {
+interface ServerIdParams extends Record<string, string> {
   serverId: string;
 }
 
 // ==========================================
 // PERMISSION FLAGS & HELPER
 // ==========================================
-const PERM = {
-  READ:             0x1,
-  SEND:             0x2,
-  REACT:            0x4,
-  MANAGE_MESSAGES:  0x8,
-  KICK:             0x10,
-  BAN:              0x20,
-  ADMIN:            0x40,
-  MANAGE_CHANNELS:  0x80,
-  MANAGE_ROLES:     0x100,
-  ALL:              0x1FF,
-} as const;
+// Le bitmask vit désormais dans un module dédié, miroir de celui du gateway
+// (`gateway/src/utils/permissions.ts`). Trois définitions divergentes
+// coexistaient auparavant, avec deux sémantiques opposées (ET côté gateway,
+// OU ici) : une permission accordée d'un côté pouvait être ignorée de l'autre.
+import { PERM as PERM_FLAGS, ALL_PERMS_MASK, KICK_ANY, BAN_ANY, normalizePerms } from './permissions';
+
+const PERM = { ...PERM_FLAGS, ALL: ALL_PERMS_MASK } as const;
 
 /**
- * Vérifie si l'utilisateur a les permissions requises sur un serveur.
- * Retourne true si l'utilisateur est owner OU si au moins un de ses rôles
- * a le flag demandé (ou ADMIN qui donne tout).
+ * L'utilisateur détient-il AU MOINS UN des bits demandés sur ce serveur ?
+ *
+ * Sémantique « au moins un », assumée et documentée ici : la plupart des
+ * appels passent un bit unique, et les paires historiques KICK_ANY / BAN_ANY
+ * exigent justement d'accepter l'une OU l'autre. Le gateway, lui, applique un
+ * ET (`checkServerPermission`) sur des masques composés — les deux couches ne
+ * calculaient pas la même chose sans que rien ne le signale.
+ * Le propriétaire et ADMIN passent tout.
  */
-async function hasPermission(userId: string, serverId: string, requiredFlag: number): Promise<boolean> {
-  const db = getDb();
-
-  // Owner a toutes les permissions
-  const [serverRows] = await db.query<RowDataPacket[]>(
-    'SELECT owner_id FROM servers WHERE id = ?', [serverId]
-  );
-  if (!serverRows.length) return false;
-  if (serverRows[0].owner_id === userId) return true;
-
-  // Récupérer les rôles du membre
-  const [memberRows] = await db.query<RowDataPacket[]>(
-    'SELECT role_ids FROM server_members WHERE server_id = ? AND user_id = ?',
-    [serverId, userId]
-  );
-  if (!memberRows.length) return false;
-
-  let roleIds: string[];
-  try {
-    roleIds = typeof memberRows[0].role_ids === 'string'
-      ? JSON.parse(memberRows[0].role_ids)
-      : memberRows[0].role_ids || [];
-  } catch {
-    roleIds = [];
-  }
-  if (!roleIds.length) return false;
-
-  // Récupérer les permissions des rôles
-  const placeholders = roleIds.map(() => '?').join(',');
-  const [roles] = await db.query<RowDataPacket[]>(
-    `SELECT permissions FROM roles WHERE id IN (${placeholders}) AND server_id = ?`,
-    [...roleIds, serverId]
-  );
-
-  for (const role of roles) {
-    let perms: number;
-    try {
-      perms = typeof role.permissions === 'string' ? JSON.parse(role.permissions) : (role.permissions ?? 0);
-    } catch {
-      perms = 0;
-    }
-    // Mask to valid range to prevent permissions:-1 or 0x80000000 bypass
-    perms = perms & PERM.ALL;
-    // ADMIN flag grants everything
-    if (perms & PERM.ADMIN) return true;
-    if (perms & requiredFlag) return true;
-  }
-
-  return false;
+async function hasPermission(userId: string, serverId: string, anyOfFlags: number): Promise<boolean> {
+  const perms = await getUserPermBits(userId, serverId);
+  if (perms.isOwner) return true;
+  if (perms.perms & PERM.ADMIN) return true;
+  return (perms.perms & anyOfFlags) !== 0;
 }
 
 /**
@@ -174,6 +130,136 @@ async function isOwner(userId: string, serverId: string): Promise<boolean> {
     'SELECT owner_id FROM servers WHERE id = ?', [serverId]
   );
   return rows.length > 0 && rows[0].owner_id === userId;
+}
+
+/**
+ * Bits de permission cumulés d'un membre + statut propriétaire.
+ * Sert aux contrôles anti-escalade : on ne peut jamais accorder un bit qu'on n'a pas.
+ */
+async function getUserPermBits(userId: string, serverId: string): Promise<{ isOwner: boolean; perms: number }> {
+  const db = getDb();
+  const [serverRows] = await db.query<RowDataPacket[]>('SELECT owner_id FROM servers WHERE id = ?', [serverId]);
+  if (!(serverRows as any[]).length) return { isOwner: false, perms: 0 };
+  if ((serverRows as any[])[0].owner_id === userId) return { isOwner: true, perms: PERM.ALL };
+
+  const [memberRows] = await db.query<RowDataPacket[]>(
+    'SELECT role_ids FROM server_members WHERE server_id = ? AND user_id = ?', [serverId, userId]
+  );
+  if (!(memberRows as any[]).length) return { isOwner: false, perms: 0 };
+
+  let roleIds: string[];
+  try {
+    const raw = (memberRows as any[])[0].role_ids;
+    roleIds = typeof raw === 'string' ? JSON.parse(raw) : raw || [];
+  } catch { roleIds = []; }
+
+  let roles: RowDataPacket[];
+  if (!Array.isArray(roleIds) || !roleIds.length) {
+    // Membre sans rôle explicite : il hérite du rôle par défaut du serveur.
+    // Les membres ajoutés avant la colonne `role_ids`, et ceux d'un serveur
+    // sans rôle par défaut, se retrouvaient sinon avec 0 permission — donc
+    // muets et privés d'historique alors qu'ils sont bien membres.
+    const [defaultRoles] = await db.query<RowDataPacket[]>(
+      'SELECT permissions FROM roles WHERE server_id = ? AND is_default = TRUE LIMIT 1', [serverId]
+    );
+    roles = defaultRoles as RowDataPacket[];
+  } else {
+    const placeholders = roleIds.map(() => '?').join(',');
+    const [named] = await db.query<RowDataPacket[]>(
+      `SELECT permissions FROM roles WHERE id IN (${placeholders}) AND server_id = ?`, [...roleIds, serverId]
+    );
+    roles = named as RowDataPacket[];
+  }
+
+  let perms = 0;
+  for (const role of roles as any[]) {
+    perms |= normalizePerms(role.permissions);
+  }
+  // ADMIN vaut tout : l'expliciter évite d'avoir à le retester partout.
+  if (perms & PERM.ADMIN) perms = PERM.ALL;
+  return { isOwner: false, perms };
+}
+
+/**
+ * Un modérateur ne peut agir que sur un membre dont les permissions cumulées sont
+ * incluses dans les siennes. Empêche deux modérateurs de même niveau de s'expulser,
+ * et un modérateur d'expulser un administrateur.
+ */
+async function canActOn(actorId: string, targetUserId: string, serverId: string): Promise<boolean> {
+  if (actorId === 'internal') return true;
+  const actor = await getUserPermBits(actorId, serverId);
+  if (actor.isOwner) return true;
+  const target = await getUserPermBits(targetUserId, serverId);
+  if (target.isOwner) return false;
+  return (target.perms & ~actor.perms) === 0;
+}
+
+/**
+ * Middleware : réserve une route aux membres du serveur.
+ * Les appels internes du gateway (x-internal-secret sans x-user-id → userId 'internal')
+ * passent : le gateway a déjà authentifié l'appelant, et ces appels servent justement à
+ * calculer les permissions.
+ */
+async function requireMember(req: Request, res: Response, next: NextFunction): Promise<void> {
+  const userId = (req as AuthRequest).userId;
+  if (!userId) { res.status(401).json({ error: 'Authentification requise' }); return; }
+  if (userId === 'internal') return next();
+
+  const serverId = (req.params as any).serverId;
+  if (!serverId) { res.status(400).json({ error: 'serverId requis' }); return; }
+
+  try {
+    const db = getDb();
+    const [rows] = await db.query<RowDataPacket[]>(
+      `SELECT 1 FROM server_members WHERE server_id = ? AND user_id = ?
+       UNION SELECT 1 FROM servers WHERE id = ? AND owner_id = ?`,
+      [serverId, userId, serverId, userId]
+    );
+    if (!(rows as any[]).length) {
+      res.status(403).json({ error: 'Accès refusé — vous n\'êtes pas membre de ce serveur' });
+      return;
+    }
+    next();
+  } catch (err) {
+    logger.error('Erreur vérification appartenance:', err);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+}
+
+/**
+ * Middleware : exige un flag de permission sur le serveur de l'URL.
+ * À chaîner après `authMiddleware` (et généralement `requireMember`).
+ */
+function requirePerm(flag: number, label: string) {
+  return async function (req: Request, res: Response, next: NextFunction): Promise<void> {
+    const userId = (req as AuthRequest).userId;
+    if (!userId) { res.status(401).json({ error: 'Authentification requise' }); return; }
+    if (userId === 'internal') return next();
+    const serverId = (req.params as any).serverId;
+    try {
+      if (!(await hasPermission(userId, serverId, flag))) {
+        res.status(403).json({ error: `Permission insuffisante — ${label} requis` });
+        return;
+      }
+      next();
+    } catch (err) {
+      logger.error('Erreur vérification permission:', err);
+      res.status(500).json({ error: 'Erreur serveur' });
+    }
+  };
+}
+
+/**
+ * Vérifie qu'un salon appartient bien au serveur de l'URL.
+ * Sans ce contrôle, `serverId` sert seulement au contrôle de permission et `channelId`
+ * peut désigner le salon d'un tout autre serveur.
+ */
+async function channelInServer(channelId: string, serverId: string): Promise<boolean> {
+  const db = getDb();
+  const [rows] = await db.query<RowDataPacket[]>(
+    'SELECT 1 FROM channels WHERE id = ? AND server_id = ?', [channelId, serverId]
+  );
+  return (rows as any[]).length > 0;
 }
 
 /** Consigne une action de modération/administration — best-effort, ne doit jamais faire échouer l'action elle-même. */
@@ -191,7 +277,7 @@ async function logAudit(
       [uuidv4(), serverId, actorId, action, target?.type ?? null, target?.id ?? null, metadata ? JSON.stringify(metadata) : null]
     );
   } catch (err) {
-    logger.warn({ err }, `Erreur écriture audit log (${action}):`);
+    logger.warn(`Erreur écriture audit log (${action}):`, { err });
   }
 }
 
@@ -209,7 +295,7 @@ async function checkModeration2FA(serverId: string, actorId: string): Promise<{ 
   return { ok: false, error: 'Ce serveur exige la double authentification pour modérer — activez-la dans Connexion & 2FA.' };
 }
 
-interface ServerChannelParams {
+interface ServerChannelParams extends Record<string, string> {
   serverId: string;
   channelId: string;
 }
@@ -249,7 +335,10 @@ function getDb() {
         const [rows] = await pool.execute<T>(sql, params);
         return [rows];
       } catch (error: any) {
-        logger.error(`Database query error: ${error.message}`, { sql, params });
+        // Ne JAMAIS journaliser `params` : on y trouve des hashes de mot de
+        // passe, des node_token, des jetons de rafraîchissement et des
+        // ciphertexts. Le nombre de paramètres suffit au diagnostic.
+        logger.error(`Database query error: ${error.message}`, { sql, paramCount: params?.length ?? 0 });
         throw error;
       }
     },
@@ -258,7 +347,7 @@ function getDb() {
         const [result] = await pool.execute<ResultSetHeader>(sql, params);
         return result;
       } catch (error: any) {
-        logger.error(`Database execute error: ${error.message}`, { sql, params });
+        logger.error(`Database execute error: ${error.message}`, { sql, paramCount: params?.length ?? 0 });
         throw error;
       }
     },
@@ -361,11 +450,36 @@ serversRouter.post('/register',
 
 // ============ HEARTBEAT DU SERVEUR HÉBERGÉ ============
 
-serversRouter.post('/:serverId/ping', authMiddleware, async (req: AuthRequest, res) => {
+serversRouter.post('/:serverId/ping', async (req: AuthRequest, res) => {
   try {
     const { serverId } = req.params;
-    const { stats } = req.body; // Optionnel: stats du serveur (CPU, RAM, utilisateurs connectés)
     const db = getDb();
+
+    // Le ping vient du server-node lui-même, pas d'un utilisateur : il
+    // s'authentifie avec son node_token. Auparavant un simple JWT suffisait,
+    // donc n'importe quel compte pouvait déclarer n'importe quel serveur en
+    // ligne et écrire un hash Redis arbitraire.
+    const nodeToken = (req.headers['x-node-token'] as string | undefined) || req.body?.nodeToken;
+    if (!nodeToken || typeof nodeToken !== 'string') {
+      return res.status(401).json({ error: 'node_token requis' });
+    }
+    const [owners] = await db.query<RowDataPacket[]>(
+      'SELECT id FROM servers WHERE id = ? AND node_token = ?', [serverId, nodeToken]
+    );
+    if (!(owners as any[]).length) {
+      return res.status(401).json({ error: 'node_token invalide' });
+    }
+
+    // `stats` était écrit tel quel dans Redis : ni schéma, ni plafond de taille.
+    const NUMERIC_STATS = ['cpu', 'ram', 'ramMax', 'uptime', 'connectedUsers', 'messageCount'] as const;
+    const rawStats = req.body?.stats;
+    const stats: Record<string, string> = {};
+    if (rawStats && typeof rawStats === 'object') {
+      for (const key of NUMERIC_STATS) {
+        const value = Number((rawStats as Record<string, unknown>)[key]);
+        if (Number.isFinite(value)) stats[key] = String(value);
+      }
+    }
 
     await db.execute(
       'UPDATE servers SET is_online = TRUE, last_ping_at = NOW() WHERE id = ?',
@@ -374,8 +488,9 @@ serversRouter.post('/:serverId/ping', authMiddleware, async (req: AuthRequest, r
 
     await redis.zadd('servers:online', Date.now(), serverId);
 
-    if (stats) {
+    if (Object.keys(stats).length > 0) {
       await redis.hset(`server:stats:${serverId}`, stats);
+      await redis.expire(`server:stats:${serverId}`, 3600);
     }
 
     res.json({ success: true, timestamp: Date.now() });
@@ -401,18 +516,39 @@ serversRouter.get('/', authMiddleware, async (req: AuthRequest, res) => {
       [userId]
     );
 
-    // Récupérer les channels et le statut de chaque serveur
-    const result = await Promise.all(
-      (servers as any[]).map(async (server) => {
-        const [channels] = await db.query(
-          'SELECT * FROM channels WHERE server_id = ? ORDER BY position',
-          [server.id]
-        );
+    const serverIds = (servers as any[]).map((srv: any) => srv.id);
 
-        // Vérifier le statut en ligne dans Redis
-        const hostInfo = await redis.hget('servers:registry', server.id);
-        let isOnline = false;
-        try { if (hostInfo) isOnline = JSON.parse(hostInfo).isOnline ?? false; } catch { /* donnée corrompue */ }
+    // Salons de TOUS les serveurs en une requête, et statut en ligne en un seul
+    // HMGET. La version précédente faisait une requête SQL + un HGET Redis PAR
+    // serveur : 50 serveurs = 100 allers-retours à chaque ouverture de l'app.
+    const channelsByServer = new Map<string, any[]>();
+    const onlineByServer = new Map<string, boolean>();
+
+    if (serverIds.length > 0) {
+      const placeholders = serverIds.map(() => '?').join(',');
+      const [allChannels] = await db.query(
+        `SELECT * FROM channels WHERE server_id IN (${placeholders}) ORDER BY server_id, position`,
+        serverIds
+      );
+      for (const ch of allChannels as any[]) {
+        const list = channelsByServer.get(ch.server_id) ?? [];
+        list.push(ch);
+        channelsByServer.set(ch.server_id, list);
+      }
+
+      try {
+        const hostInfos = await redis.hmget('servers:registry', ...serverIds);
+        serverIds.forEach((id: string, i: number) => {
+          const raw = hostInfos[i];
+          if (!raw) return;
+          try { onlineByServer.set(id, JSON.parse(raw).isOnline ?? false); } catch { /* donnée corrompue */ }
+        });
+      } catch { /* Redis indisponible — tous hors ligne */ }
+    }
+
+    const result = (servers as any[]).map((server) => {
+        const channels = channelsByServer.get(server.id) ?? [];
+        const isOnline = onlineByServer.get(server.id) ?? false;
 
         return {
           id: server.id,
@@ -436,8 +572,7 @@ serversRouter.get('/', authMiddleware, async (req: AuthRequest, res) => {
             topic: ch.topic,
           })),
         };
-      })
-    );
+      });
 
     res.json(result);
   } catch (error) {
@@ -480,7 +615,7 @@ serversRouter.get('/quota', authMiddleware, async (req: AuthRequest, res) => {
 
 // ============ RÉCUPÉRER UN SERVEUR ============
 
-serversRouter.get('/:serverId', async (req, res) => {
+serversRouter.get('/:serverId', authMiddleware, requireMember, async (req, res) => {
   try {
     const { serverId } = req.params;
     const db = getDb();
@@ -688,7 +823,7 @@ serversRouter.post<ServerIdParams>('/:serverId/leave',
 // ============ GÉRER LES CHANNELS ============
 
 // Récupérer tous les channels d'un serveur
-serversRouter.get<ServerIdParams>('/:serverId/channels', async (req, res) => {
+serversRouter.get<ServerIdParams>('/:serverId/channels', authMiddleware, requireMember, async (req, res) => {
   try {
     const { serverId } = req.params;
     const db = getDb();
@@ -844,7 +979,19 @@ serversRouter.post<ServerIdParams>('/:serverId/roles',
 
       const { name, color = '#99AAB5', permissions = 0 } = req.body;
       // Masquer les permissions à la plage valide — jamais stocker la valeur brute du client
-      const safePermissions = (Number(permissions) || 0) & PERM.ALL;
+      let safePermissions = (Number(permissions) || 0) & PERM.ALL;
+
+      // Anti-escalade : un non-propriétaire ne peut accorder que des bits qu'il possède,
+      // et jamais ADMIN. Même règle que le chemin WebSocket du gateway, portée ici pour
+      // qu'elle s'applique aussi aux appels REST directs.
+      if (actorId !== 'internal') {
+        const actor = await getUserPermBits(actorId, serverId);
+        if (!actor.isOwner) {
+          safePermissions &= actor.perms;
+          safePermissions &= ~PERM.ADMIN;
+        }
+      }
+
       const db = getDb();
       const roleId = uuidv4();
 
@@ -1100,7 +1247,7 @@ serversRouter.delete<ServerIdParams>('/:serverId', authMiddleware, async (req: A
 
 // ============ MEMBRES ============
 
-serversRouter.get('/:serverId/members/:userId/check', async (req, res) => {
+serversRouter.get('/:serverId/members/:userId/check', authMiddleware, async (req, res) => {
   try {
     const { serverId, userId } = req.params;
     const db = getDb();
@@ -1117,7 +1264,42 @@ serversRouter.get('/:serverId/members/:userId/check', async (req, res) => {
   }
 });
 
-serversRouter.get<ServerIdParams>('/:serverId/members', async (req, res) => {
+// Permissions cumulées d'un membre — un entier, calculé côté SQL.
+// Le gateway appelait auparavant getServer + getMembers + getRoles à chaque
+// message : trois requêtes HTTP qui rapatriaient la liste complète des membres
+// (jointe à `users`) pour un simple `Array.find`. Sur un serveur de 5 000
+// membres, cela représentait ~10 000 lignes JSON PAR MESSAGE envoyé.
+serversRouter.get('/:serverId/members/:userId/permissions', authMiddleware, async (req, res) => {
+  try {
+    const { serverId, userId } = req.params;
+    const db = getDb();
+
+    const [serverRows] = await db.query<RowDataPacket[]>(
+      'SELECT owner_id FROM servers WHERE id = ?', [serverId]
+    );
+    if (!serverRows.length) return res.status(404).json({ error: 'Serveur non trouvé' });
+
+    const bits = await getUserPermBits(userId, serverId);
+    if (bits.isOwner) {
+      return res.json({ isMember: true, isOwner: true, permissions: PERM.ALL });
+    }
+
+    const [memberRows] = await db.query<RowDataPacket[]>(
+      'SELECT 1 FROM server_members WHERE server_id = ? AND user_id = ? LIMIT 1',
+      [serverId, userId]
+    );
+    res.json({
+      isMember: (memberRows as any[]).length > 0,
+      isOwner: false,
+      permissions: bits.perms,
+    });
+  } catch (error) {
+    logger.error('Erreur calcul permissions membre:', error);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+serversRouter.get<ServerIdParams>('/:serverId/members', authMiddleware, requireMember, async (req, res) => {
   try {
     const { serverId } = req.params;
     const showBanned = req.query.showBanned === 'true';
@@ -1237,11 +1419,14 @@ serversRouter.post('/:serverId/members/:userId/kick', authMiddleware, async (req
     const actorId = req.userId!;
 
     if (actorId === userId) return res.status(400).json({ error: 'Impossible de vous expulser vous-même' });
-    if (!(await hasPermission(actorId, serverId, PERM.KICK))) {
+    if (!(await hasPermission(actorId, serverId, KICK_ANY))) {
       return res.status(403).json({ error: 'Permission insuffisante — KICK requis' });
     }
     if (await isOwner(userId, serverId)) {
       return res.status(403).json({ error: 'Impossible d\'expulser le propriétaire' });
+    }
+    if (!(await canActOn(actorId, userId, serverId))) {
+      return res.status(403).json({ error: 'Ce membre a des permissions supérieures ou égales aux vôtres' });
     }
     const twoFa = await checkModeration2FA(serverId, actorId);
     if (!twoFa.ok) return res.status(403).json({ error: twoFa.error });
@@ -1264,11 +1449,14 @@ serversRouter.post('/:serverId/members/:userId/ban', authMiddleware, async (req:
     const { reason } = req.body;
 
     if (actorId === userId) return res.status(400).json({ error: 'Impossible de vous bannir vous-même' });
-    if (!(await hasPermission(actorId, serverId, PERM.BAN))) {
+    if (!(await hasPermission(actorId, serverId, BAN_ANY))) {
       return res.status(403).json({ error: 'Permission insuffisante — BAN requis' });
     }
     if (await isOwner(userId, serverId)) {
       return res.status(403).json({ error: 'Impossible de bannir le propriétaire' });
+    }
+    if (!(await canActOn(actorId, userId, serverId))) {
+      return res.status(403).json({ error: 'Ce membre a des permissions supérieures ou égales aux vôtres' });
     }
     const twoFa = await checkModeration2FA(serverId, actorId);
     if (!twoFa.ok) return res.status(403).json({ error: twoFa.error });
@@ -1295,7 +1483,7 @@ serversRouter.delete('/:serverId/members/:userId/ban', authMiddleware, async (re
     const { serverId, userId } = req.params;
     const actorId = req.userId!;
 
-    if (!(await hasPermission(actorId, serverId, PERM.BAN))) {
+    if (!(await hasPermission(actorId, serverId, BAN_ANY))) {
       return res.status(403).json({ error: 'Permission insuffisante — BAN requis' });
     }
 
@@ -1311,7 +1499,7 @@ serversRouter.delete('/:serverId/members/:userId/ban', authMiddleware, async (re
 
 // ============ RÔLES (mise à jour / suppression) ============
 
-serversRouter.get<ServerIdParams>('/:serverId/roles', async (req, res) => {
+serversRouter.get<ServerIdParams>('/:serverId/roles', authMiddleware, requireMember, async (req, res) => {
   try {
     const { serverId } = req.params;
     const db = getDb();
@@ -1349,8 +1537,38 @@ serversRouter.patch('/:serverId/roles/:roleId', authMiddleware, async (req, res)
     const { name, color, permissions, iconEmoji, iconUrl, position } = req.body;
     const db = getDb();
 
+    // Le rôle doit appartenir à CE serveur — sans quoi un roleId suffit à toucher
+    // le rôle d'un serveur tiers.
+    const [target] = await db.query<RowDataPacket[]>(
+      'SELECT position, permissions FROM roles WHERE id = ? AND server_id = ?', [roleId, serverId]
+    );
+    if (!(target as any[]).length) return res.status(404).json({ error: 'Rôle introuvable dans ce serveur' });
+
     // Masquer les permissions à la plage valide
-    const safePermissions = permissions !== undefined ? (permissions & PERM.ALL) : undefined;
+    let safePermissions = permissions !== undefined ? (Number(permissions) || 0) & PERM.ALL : undefined;
+    let safePosition = position;
+
+    // Anti-escalade, identique au chemin WebSocket : on ne peut ni accorder un bit
+    // qu'on n'a pas, ni ADMIN, ni toucher un rôle situé au-dessus du sien, ni
+    // réorganiser la hiérarchie si on n'est pas propriétaire.
+    if (actorId !== 'internal') {
+      const actor = await getUserPermBits(actorId, serverId);
+      if (!actor.isOwner) {
+        let targetPerms = 0;
+        try {
+          const raw = (target as any[])[0].permissions;
+          targetPerms = (Number(typeof raw === 'string' ? JSON.parse(raw) : raw) || 0) & PERM.ALL;
+        } catch { targetPerms = 0; }
+        if (targetPerms & ~actor.perms) {
+          return res.status(403).json({ error: 'Ce rôle a des permissions supérieures aux vôtres' });
+        }
+        if (safePermissions !== undefined) {
+          safePermissions &= actor.perms;
+          safePermissions &= ~PERM.ADMIN;
+        }
+        safePosition = undefined;
+      }
+    }
 
     const updates: string[] = [];
     const params: any[] = [];
@@ -1360,15 +1578,15 @@ serversRouter.patch('/:serverId/roles/:roleId', authMiddleware, async (req, res)
     if (safePermissions !== undefined) { updates.push('permissions = ?'); params.push(JSON.stringify(safePermissions)); }
     if (iconEmoji !== undefined) { updates.push('icon_emoji = ?'); params.push(iconEmoji); }
     if (iconUrl !== undefined) { updates.push('icon_url = ?'); params.push(iconUrl); }
-    if (position !== undefined) { updates.push('position = ?'); params.push(position); }
+    if (safePosition !== undefined) { updates.push('position = ?'); params.push(safePosition); }
 
     if (updates.length > 0) {
-      params.push(roleId);
-      await db.execute(`UPDATE roles SET ${updates.join(', ')} WHERE id = ?`, params);
+      params.push(roleId, serverId);
+      await db.execute(`UPDATE roles SET ${updates.join(', ')} WHERE id = ? AND server_id = ?`, params);
       await logAudit(serverId, actorId, 'role_update', { type: 'role', id: roleId }, { fields: Object.keys(req.body) });
     }
 
-    res.json({ success: true });
+    res.json({ success: true, id: roleId, permissions: safePermissions });
   } catch (error) {
     logger.error('Erreur modification rôle:', error);
     res.status(500).json({ error: 'Erreur serveur' });
@@ -1386,7 +1604,41 @@ serversRouter.delete('/:serverId/roles/:roleId', authMiddleware, async (req, res
     }
 
     const db = getDb();
-    await db.execute('DELETE FROM roles WHERE id = ? AND is_default = FALSE', [roleId]);
+    const [target] = await db.query<RowDataPacket[]>(
+      'SELECT permissions, is_default FROM roles WHERE id = ? AND server_id = ?', [roleId, serverId]
+    );
+    if (!(target as any[]).length) return res.status(404).json({ error: 'Rôle introuvable dans ce serveur' });
+    if ((target as any[])[0].is_default) {
+      return res.status(400).json({ error: 'Le rôle par défaut ne peut pas être supprimé' });
+    }
+
+    // On ne supprime pas un rôle plus puissant que le sien.
+    if (actorId !== 'internal') {
+      const actor = await getUserPermBits(actorId, serverId);
+      if (!actor.isOwner) {
+        let targetPerms = 0;
+        try {
+          const raw = (target as any[])[0].permissions;
+          targetPerms = (Number(typeof raw === 'string' ? JSON.parse(raw) : raw) || 0) & PERM.ALL;
+        } catch { targetPerms = 0; }
+        if (targetPerms & ~actor.perms) {
+          return res.status(403).json({ error: 'Ce rôle a des permissions supérieures aux vôtres' });
+        }
+      }
+    }
+
+    await db.transaction(async (conn) => {
+      await conn.execute('DELETE FROM roles WHERE id = ? AND server_id = ? AND is_default = FALSE', [roleId, serverId]);
+      // Nettoyer les références au rôle supprimé dans role_ids (tableau JSON) : sans ça
+      // les membres gardent l'identifiant d'un rôle qui n'existe plus.
+      await conn.execute(
+        `UPDATE server_members
+         SET role_ids = JSON_REMOVE(role_ids, JSON_UNQUOTE(JSON_SEARCH(role_ids, 'one', ?)))
+         WHERE server_id = ? AND JSON_SEARCH(role_ids, 'one', ?) IS NOT NULL`,
+        [roleId, serverId, roleId]
+      );
+    });
+
     await logAudit(serverId, actorId, 'role_delete', { type: 'role', id: roleId });
     res.json({ success: true });
   } catch (error) {
@@ -1460,7 +1712,7 @@ serversRouter.post<ServerIdParams>('/:serverId/invites', authMiddleware, async (
   }
 });
 
-serversRouter.get<ServerIdParams>('/:serverId/invites', async (req, res) => {
+serversRouter.get<ServerIdParams>('/:serverId/invites', authMiddleware, requireMember, async (req, res) => {
   try {
     const { serverId } = req.params;
     const db = getDb();
@@ -1684,10 +1936,15 @@ serversRouter.get('/invite/:code', async (req, res) => {
 
 // ============ MESSAGES SERVEUR ============
 
-serversRouter.get<ServerChannelParams>('/:serverId/channels/:channelId/messages', async (req, res) => {
+serversRouter.get<ServerChannelParams>('/:serverId/channels/:channelId/messages', authMiddleware, requireMember, async (req, res) => {
   try {
     const { serverId, channelId } = req.params;
     const { limit = '50', before } = req.query;
+
+    if (!(await channelInServer(channelId, serverId))) {
+      return res.status(404).json({ error: 'Salon introuvable dans ce serveur' });
+    }
+
     const db = getDb();
 
     let query = `SELECT sm.*, u.username, u.display_name, u.avatar_url
@@ -1754,13 +2011,31 @@ serversRouter.get<ServerChannelParams>('/:serverId/channels/:channelId/messages'
 });
 
 serversRouter.post<ServerChannelParams>('/:serverId/channels/:channelId/messages',
+  authMiddleware,
+  requireMember,
   body('content').isString().isLength({ min: 1, max: 4000 }),
-  body('senderId').isUUID(),
   body('tags').optional().isArray(),
   async (req, res) => {
     try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ error: 'Données invalides', details: errors.array() });
+
       const { serverId, channelId } = req.params;
-      const { content, senderId, attachments, replyToId, tags } = req.body;
+      const { content, attachments, replyToId, tags } = req.body;
+      const actorId = (req as AuthRequest).userId!;
+
+      // L'auteur vient de l'identité authentifiée, jamais du corps de la requête.
+      // Seul le gateway (secret interne) peut agir au nom d'un tiers via senderId.
+      const senderId = actorId === 'internal' ? req.body.senderId : actorId;
+      if (!senderId) return res.status(400).json({ error: 'senderId requis' });
+
+      if (!(await channelInServer(channelId, serverId))) {
+        return res.status(404).json({ error: 'Salon introuvable dans ce serveur' });
+      }
+      if (actorId !== 'internal' && !(await hasPermission(actorId, serverId, PERM.SEND))) {
+        return res.status(403).json({ error: 'Permission insuffisante — SEND requis' });
+      }
+
       const db = getDb();
       const messageId = uuidv4();
 
@@ -1812,21 +2087,32 @@ serversRouter.post<ServerChannelParams>('/:serverId/channels/:channelId/messages
 );
 
 serversRouter.patch('/:serverId/messages/:messageId',
+  authMiddleware,
+  requireMember,
   body('content').isString().isLength({ min: 1, max: 4000 }),
   async (req, res) => {
     try {
-      const { messageId } = req.params as { serverId: string; messageId: string };
-      const { content, senderId } = req.body;
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ error: 'Données invalides', details: errors.array() });
+
+      const { serverId, messageId } = req.params as { serverId: string; messageId: string };
+      const { content } = req.body;
+      const actorId = (req as AuthRequest).userId!;
+      const editorId = actorId === 'internal' ? req.body.senderId : actorId;
       const db = getDb();
 
-      // Vérifier que le message appartient à l'utilisateur
-      const [msgs] = await db.query('SELECT sender_id FROM server_messages WHERE id = ?', [messageId]);
+      // Le message doit exister DANS CE SERVEUR et appartenir à l'auteur authentifié.
+      const [msgs] = await db.query(
+        'SELECT sender_id FROM server_messages WHERE id = ? AND server_id = ?', [messageId, serverId]
+      );
       if ((msgs as any[]).length === 0) return res.status(404).json({ error: 'Message introuvable' });
-      if ((msgs as any[])[0].sender_id !== senderId) return res.status(403).json({ error: 'Non autorisé' });
+      if ((msgs as any[])[0].sender_id !== editorId) {
+        return res.status(403).json({ error: 'Seul l\'auteur peut modifier son message' });
+      }
 
       await db.execute(
-        'UPDATE server_messages SET content = ?, is_edited = TRUE WHERE id = ?',
-        [content, messageId]
+        'UPDATE server_messages SET content = ?, is_edited = TRUE WHERE id = ? AND server_id = ?',
+        [content, messageId, serverId]
       );
 
       res.json({ success: true, messageId, content });
@@ -1837,17 +2123,28 @@ serversRouter.patch('/:serverId/messages/:messageId',
   }
 );
 
-serversRouter.delete('/:serverId/messages/:messageId', async (req, res) => {
+serversRouter.delete('/:serverId/messages/:messageId', authMiddleware, requireMember, async (req, res) => {
   try {
-    const { messageId } = req.params;
-    const { senderId } = req.body;
+    const { serverId, messageId } = req.params;
+    const actorId = (req as AuthRequest).userId!;
+    const requesterId = actorId === 'internal' ? req.body?.senderId : actorId;
     const db = getDb();
 
-    const [msgs] = await db.query('SELECT sender_id FROM server_messages WHERE id = ?', [messageId]);
+    const [msgs] = await db.query(
+      'SELECT sender_id FROM server_messages WHERE id = ? AND server_id = ?', [messageId, serverId]
+    );
     if ((msgs as any[]).length === 0) return res.status(404).json({ error: 'Message introuvable' });
-    if ((msgs as any[])[0].sender_id !== senderId) return res.status(403).json({ error: 'Non autorisé' });
 
-    await db.execute('UPDATE server_messages SET is_deleted = TRUE WHERE id = ?', [messageId]);
+    // Son propre message, ou MANAGE_MESSAGES pour modérer celui d'un autre.
+    const isAuthor = (msgs as any[])[0].sender_id === requesterId;
+    if (!isAuthor && actorId !== 'internal') {
+      if (!(await hasPermission(actorId, serverId, PERM.MANAGE_MESSAGES))) {
+        return res.status(403).json({ error: 'Permission insuffisante — MANAGE_MESSAGES requis' });
+      }
+      await logAudit(serverId, actorId, 'message_delete', { type: 'message', id: messageId });
+    }
+
+    await db.execute('UPDATE server_messages SET is_deleted = TRUE WHERE id = ? AND server_id = ?', [messageId, serverId]);
     res.json({ success: true });
   } catch (error) {
     logger.error('Erreur suppression message serveur:', error);
@@ -1858,18 +2155,33 @@ serversRouter.delete('/:serverId/messages/:messageId', async (req, res) => {
 // ============ RÉACTIONS MESSAGES SERVEUR ============
 
 serversRouter.post('/:serverId/messages/:messageId/reactions',
+  authMiddleware,
+  requireMember,
   body('emoji').isString().isLength({ min: 1, max: 50 }),
-  body('userId').isUUID(),
   async (req, res) => {
     try {
-      const { messageId } = req.params as { serverId: string; messageId: string };
-      const { emoji, userId } = req.body;
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ error: 'Données invalides', details: errors.array() });
+
+      const { serverId, messageId } = req.params as { serverId: string; messageId: string };
+      const { emoji } = req.body;
+      const actorId = (req as AuthRequest).userId!;
+      const userId = actorId === 'internal' ? req.body.userId : actorId;
+      if (!userId) return res.status(400).json({ error: 'userId requis' });
+
+      if (actorId !== 'internal' && !(await hasPermission(actorId, serverId, PERM.REACT))) {
+        return res.status(403).json({ error: 'Permission insuffisante — REACT requis' });
+      }
+
       const db = getDb();
-      const reactionId = uuidv4();
+      const [msgs] = await db.query(
+        'SELECT 1 FROM server_messages WHERE id = ? AND server_id = ?', [messageId, serverId]
+      );
+      if ((msgs as any[]).length === 0) return res.status(404).json({ error: 'Message introuvable' });
 
       await db.execute(
         'INSERT IGNORE INTO server_message_reactions (id, message_id, user_id, emoji) VALUES (?, ?, ?, ?)',
-        [reactionId, messageId, userId, emoji]
+        [uuidv4(), messageId, userId, emoji]
       );
 
       res.json({ success: true });
@@ -1880,15 +2192,20 @@ serversRouter.post('/:serverId/messages/:messageId/reactions',
   }
 );
 
-serversRouter.delete('/:serverId/messages/:messageId/reactions/:emoji', async (req, res) => {
+serversRouter.delete('/:serverId/messages/:messageId/reactions/:emoji', authMiddleware, requireMember, async (req, res) => {
   try {
-    const { messageId, emoji } = req.params;
-    const { userId } = req.body;
+    const { serverId, messageId, emoji } = req.params;
+    const actorId = (req as AuthRequest).userId!;
+    const userId = actorId === 'internal' ? req.body?.userId : actorId;
+    if (!userId) return res.status(400).json({ error: 'userId requis' });
     const db = getDb();
 
+    // On ne retire que SA propre réaction, et seulement sur un message de ce serveur.
     await db.execute(
-      'DELETE FROM server_message_reactions WHERE message_id = ? AND user_id = ? AND emoji = ?',
-      [messageId, userId, decodeURIComponent(emoji)]
+      `DELETE r FROM server_message_reactions r
+       JOIN server_messages m ON m.id = r.message_id
+       WHERE r.message_id = ? AND r.user_id = ? AND r.emoji = ? AND m.server_id = ?`,
+      [messageId, userId, decodeURIComponent(emoji), serverId]
     );
 
     res.json({ success: true });
@@ -1900,11 +2217,24 @@ serversRouter.delete('/:serverId/messages/:messageId/reactions/:emoji', async (r
 
 // ============ DOMAINE PERSONNALISÉ ============
 
-serversRouter.post<ServerIdParams>('/:serverId/domain/start', async (req, res) => {
+/** Un domaine personnalisé plausible : pas d'IP, pas de suffixe interne, longueur bornée. */
+function isAcceptableCustomDomain(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const d = value.trim().toLowerCase();
+  if (d.length < 4 || d.length > 253) return false;
+  if (!/^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/.test(d)) return false;
+  if (/^\d+(\.\d+){3}$/.test(d)) return false;
+  if (/\.(local|internal|localhost|test|invalid|example)$/.test(d)) return false;
+  return true;
+}
+
+serversRouter.post<ServerIdParams>('/:serverId/domain/start', authMiddleware, requirePerm(PERM.ADMIN, 'ADMIN'), async (req, res) => {
   try {
     const { serverId } = req.params;
-    const { domain } = req.body;
-    if (!domain) return res.status(400).json({ error: 'Domaine requis' });
+    const domain = typeof req.body?.domain === 'string' ? req.body.domain.trim().toLowerCase() : '';
+    if (!isAcceptableCustomDomain(domain)) {
+      return res.status(400).json({ error: 'Domaine invalide' });
+    }
 
     // Vérifier unicité du domaine
     const db = getDb();
@@ -1925,7 +2255,7 @@ serversRouter.post<ServerIdParams>('/:serverId/domain/start', async (req, res) =
   }
 });
 
-serversRouter.post<ServerIdParams>('/:serverId/domain/check', async (req, res) => {
+serversRouter.post<ServerIdParams>('/:serverId/domain/check', authMiddleware, requirePerm(PERM.ADMIN, 'ADMIN'), async (req, res) => {
   try {
     const { serverId } = req.params;
     const db = getDb();
@@ -1977,10 +2307,16 @@ serversRouter.get<ServerIdParams>('/:serverId/node-token', authMiddleware, async
   }
 });
 
-// Enregistrement automatique d'un nouveau server-node (sans owner, owner sera défini par claim-admin)
+// Enregistrement automatique d'un nouveau server-node.
 // Auth requise : évite la pollution DB illimitée par un attaquant anonyme.
+// L'appelant devient propriétaire du serveur créé — un serveur sans owner était
+// réclamable par le premier venu via claim-admin.
 serversRouter.post('/nodes/register', authMiddleware, async (req: AuthRequest, res) => {
   try {
+    const ownerId = req.userId && req.userId !== 'internal' ? req.userId : null;
+    if (!ownerId) {
+      return res.status(401).json({ error: 'Un utilisateur identifié est requis pour enregistrer un serveur' });
+    }
     const db = getDb();
     const serverId = uuidv4();
     const nodeToken = uuidv4();
@@ -1999,13 +2335,17 @@ serversRouter.post('/nodes/register', authMiddleware, async (req: AuthRequest, r
 
     await db.transaction(async (conn) => {
       await conn.execute(
-        `INSERT INTO servers (id, name, node_token, is_public, hosting_type) VALUES (?, ?, ?, FALSE, 'self_hosted')`,
-        [serverId, serverName, nodeToken]
+        `INSERT INTO servers (id, name, owner_id, node_token, is_public, hosting_type) VALUES (?, ?, ?, ?, FALSE, 'self_hosted')`,
+        [serverId, serverName, ownerId, nodeToken]
       );
       await conn.execute(
         `INSERT INTO roles (id, server_id, name, color, is_default, position, permissions)
          VALUES (?, ?, 'Membre', '#99AAB5', TRUE, 0, ?)`,
         [defaultRoleId, serverId, JSON.stringify(0x7)]  // READ|SEND|REACT = 0x7
+      );
+      await conn.execute(
+        `INSERT INTO server_members (server_id, user_id, role_ids) VALUES (?, ?, ?)`,
+        [serverId, ownerId, JSON.stringify([defaultRoleId])]
       );
       await conn.execute(
         `INSERT INTO channels (id, server_id, name, type, position) VALUES (?, ?, 'général', 'text', 0)`,
@@ -2406,6 +2746,7 @@ serversRouter.get('/badges/:serverId', async (req, res) => {
 // Récupérer les posts d'un canal forum
 serversRouter.get('/:serverId/channels/:channelId/posts',
   authMiddleware,
+  requireMember,
   async (req: AuthRequest, res) => {
     try {
       const { serverId, channelId } = req.params;
@@ -2434,6 +2775,8 @@ serversRouter.get('/:serverId/channels/:channelId/posts',
 // Créer un post dans un canal forum
 serversRouter.post('/:serverId/channels/:channelId/posts',
   authMiddleware,
+  requireMember,
+  requirePerm(PERM.SEND, 'SEND'),
   body('title').isString().isLength({ min: 1, max: 200 }),
   body('content').isString().isLength({ min: 1, max: 10000 }),
   body('tags').optional().isArray(),
@@ -2462,6 +2805,7 @@ serversRouter.post('/:serverId/channels/:channelId/posts',
 // Récupérer un post forum par ID
 serversRouter.get('/:serverId/channels/:channelId/posts/:postId',
   authMiddleware,
+  requireMember,
   async (req: AuthRequest, res) => {
     try {
       const { serverId, channelId, postId } = req.params;
@@ -2484,6 +2828,7 @@ serversRouter.get('/:serverId/channels/:channelId/posts/:postId',
 // Mettre à jour un post forum (auteur uniquement)
 serversRouter.patch('/:serverId/channels/:channelId/posts/:postId',
   authMiddleware,
+  requireMember,
   body('title').optional().isString().isLength({ min: 1, max: 200 }),
   body('content').optional().isString().isLength({ min: 1, max: 10000 }),
   body('tags').optional().isArray(),
@@ -2531,6 +2876,7 @@ serversRouter.patch('/:serverId/channels/:channelId/posts/:postId',
 // Supprimer un post forum
 serversRouter.delete('/:serverId/channels/:channelId/posts/:postId',
   authMiddleware,
+  requireMember,
   async (req: AuthRequest, res) => {
     try {
       const { serverId, channelId, postId } = req.params;
@@ -2559,6 +2905,7 @@ serversRouter.delete('/:serverId/channels/:channelId/posts/:postId',
 // Récupérer les événements d'un serveur
 serversRouter.get('/:serverId/events',
   authMiddleware,
+  requireMember,
   async (req: AuthRequest, res) => {
     try {
       const { serverId } = req.params;
@@ -2584,6 +2931,8 @@ serversRouter.get('/:serverId/events',
 // Créer un événement
 serversRouter.post('/:serverId/events',
   authMiddleware,
+  requireMember,
+  requirePerm(PERM.MANAGE_CHANNELS, 'MANAGE_CHANNELS'),
   body('title').isString().isLength({ min: 1, max: 200 }),
   body('startsAt').isISO8601(),
   body('type').isIn(['voice', 'stage', 'external']),
@@ -2617,6 +2966,7 @@ serversRouter.post('/:serverId/events',
 // Intérêt pour un événement (toggle)
 serversRouter.post('/:serverId/events/:eventId/interest',
   authMiddleware,
+  requireMember,
   async (req: AuthRequest, res) => {
     try {
       const { eventId } = req.params;
@@ -2645,6 +2995,8 @@ serversRouter.post('/:serverId/events/:eventId/interest',
 // Mettre à jour le statut d'un événement
 serversRouter.patch('/:serverId/events/:eventId',
   authMiddleware,
+  requireMember,
+  requirePerm(PERM.MANAGE_CHANNELS, 'MANAGE_CHANNELS'),
   body('status').optional().isIn(['scheduled', 'active', 'ended', 'canceled']),
   body('title').optional().isString().isLength({ max: 200 }),
   async (req: AuthRequest, res) => {
@@ -2679,6 +3031,8 @@ serversRouter.patch('/:serverId/events/:eventId',
 // Supprimer un événement
 serversRouter.delete('/:serverId/events/:eventId',
   authMiddleware,
+  requireMember,
+  requirePerm(PERM.MANAGE_CHANNELS, 'MANAGE_CHANNELS'),
   async (req: AuthRequest, res) => {
     try {
       const { serverId, eventId } = req.params;
@@ -2706,6 +3060,8 @@ serversRouter.delete('/:serverId/events/:eventId',
 // Récupérer les règles automod d'un serveur
 serversRouter.get('/:serverId/automod',
   authMiddleware,
+  requireMember,
+  requirePerm(PERM.ADMIN, 'ADMIN'),
   async (req: AuthRequest, res) => {
     try {
       const { serverId } = req.params;
@@ -2727,6 +3083,8 @@ serversRouter.get('/:serverId/automod',
 // Créer une règle automod
 serversRouter.post('/:serverId/automod',
   authMiddleware,
+  requireMember,
+  requirePerm(PERM.ADMIN, 'ADMIN'),
   body('name').isString().isLength({ min: 1, max: 100 }),
   body('triggerType').isIn(['keyword', 'spam', 'mention_spam', 'link', 'invite']),
   body('actionType').isIn(['block', 'alert', 'timeout', 'delete']),
@@ -2760,6 +3118,8 @@ serversRouter.post('/:serverId/automod',
 // Activer/désactiver une règle automod
 serversRouter.patch('/:serverId/automod/:ruleId',
   authMiddleware,
+  requireMember,
+  requirePerm(PERM.ADMIN, 'ADMIN'),
   body('enabled').optional().isBoolean(),
   body('name').optional().isString().isLength({ max: 100 }),
   body('triggerMetadata').optional().isObject(),
@@ -2794,6 +3154,8 @@ serversRouter.patch('/:serverId/automod/:ruleId',
 // Supprimer une règle automod
 serversRouter.delete('/:serverId/automod/:ruleId',
   authMiddleware,
+  requireMember,
+  requirePerm(PERM.ADMIN, 'ADMIN'),
   async (req: AuthRequest, res) => {
     try {
       const { serverId, ruleId } = req.params;
@@ -2809,7 +3171,12 @@ serversRouter.delete('/:serverId/automod/:ruleId',
 
 // Vérifier un message contre les règles automod d'un serveur (appelé par le service messages)
 serversRouter.post('/:serverId/automod/check',
+  authMiddleware,
   async (req, res) => {
+    // Route interne (service messages) — pas d'exposition aux clients.
+    if ((req as AuthRequest).userId !== 'internal') {
+      return res.status(403).json({ error: 'Accès interne uniquement' });
+    }
     try {
       const { serverId } = req.params;
       const { content, userId } = req.body;
@@ -2861,6 +3228,7 @@ serversRouter.post('/:serverId/automod/check',
 // Récupérer l'état d'un canal Stage
 serversRouter.get('/:serverId/stage/:channelId',
   authMiddleware,
+  requireMember,
   async (req: AuthRequest, res) => {
     try {
       const { channelId } = req.params;
@@ -2893,6 +3261,8 @@ serversRouter.get('/:serverId/stage/:channelId',
 // Démarrer / mettre à jour un Stage
 serversRouter.post('/:serverId/stage/:channelId/start',
   authMiddleware,
+  requireMember,
+  requirePerm(PERM.MANAGE_CHANNELS, 'MANAGE_CHANNELS'),
   body('topic').optional().isString().isLength({ max: 200 }),
   async (req: AuthRequest, res) => {
     try {
@@ -2917,6 +3287,8 @@ serversRouter.post('/:serverId/stage/:channelId/start',
 // Terminer un Stage
 serversRouter.post('/:serverId/stage/:channelId/end',
   authMiddleware,
+  requireMember,
+  requirePerm(PERM.MANAGE_CHANNELS, 'MANAGE_CHANNELS'),
   async (req: AuthRequest, res) => {
     try {
       const { channelId } = req.params;
@@ -2936,6 +3308,7 @@ serversRouter.post('/:serverId/stage/:channelId/end',
 // Rejoindre un Stage en tant que listener
 serversRouter.post('/:serverId/stage/:channelId/join',
   authMiddleware,
+  requireMember,
   body('role').isIn(['listener', 'speaker']),
   async (req: AuthRequest, res) => {
     try {
@@ -2963,6 +3336,7 @@ serversRouter.post('/:serverId/stage/:channelId/join',
 // Quitter un Stage
 serversRouter.post('/:serverId/stage/:channelId/leave',
   authMiddleware,
+  requireMember,
   async (req: AuthRequest, res) => {
     try {
       const { channelId } = req.params;
@@ -3238,7 +3612,7 @@ serversRouter.post('/webhooks/:webhookId/:token',
       const errors = validationResult(req);
       if (!errors.isEmpty()) return res.status(400).json({ error: 'Contenu invalide' });
 
-      const { webhookId, token } = req.params;
+      const { webhookId, token } = req.params as unknown as { webhookId: string; token: string };
       const db = getDb();
       const [rows] = await db.query<RowDataPacket[]>(
         'SELECT * FROM server_webhooks WHERE id = ? AND token = ?',
@@ -3575,6 +3949,13 @@ async function start() {
       `ALTER TABLE server_members ADD COLUMN role_ids JSON`,
       `ALTER TABLE server_members ADD COLUMN is_muted BOOLEAN DEFAULT FALSE`,
       `ALTER TABLE server_members ADD COLUMN is_deafened BOOLEAN DEFAULT FALSE`,
+      // PK = (server_id, user_id) : `GET /servers` filtre sur sm.user_id seul,
+      // le prefixe de la PK ne s'applique donc pas et MySQL scanne la table
+      // entiere a chaque ouverture de l'application.
+      `ALTER TABLE server_members ADD INDEX idx_member_user (user_id)`,
+      // `WHERE server_id = ? ORDER BY position` : sans la colonne de tri dans
+      // l'index, MySQL trie en memoire a chaque chargement de serveur.
+      `ALTER TABLE channels ADD INDEX idx_channel_server_position (server_id, position)`,
 
       // Colonnes additionnelles pour channels
       `ALTER TABLE channels ADD COLUMN parent_id VARCHAR(36)`,
