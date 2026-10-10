@@ -66,7 +66,8 @@ function authMiddleware(req: AuthRequest, res: Response, next: NextFunction): vo
   }
   try {
     const token = authHeader.slice(7);
-    const decoded = jwt.verify(token, JWT_SECRET!) as { userId: string };
+    const decoded = jwt.verify(token, JWT_SECRET!, { algorithms: ['HS256'] }) as { userId: string; type?: string };
+    if (decoded.type && decoded.type !== 'access') throw new Error('wrong token type');
     req.userId = decoded.userId;
     next();
   } catch {
@@ -306,7 +307,8 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS || process.env.FRONTEND_URL 
 app.use(cors({
   origin: (origin, cb) => {
     if (!origin) return cb(null, true);
-    if (/^http:\/\/localhost(:\d+)?$/.test(origin)) return cb(null, true);
+    // localhost uniquement hors production.
+    if (process.env.NODE_ENV !== 'production' && /^http:\/\/localhost(:\d+)?$/.test(origin)) return cb(null, true);
     if (allowedOrigins.includes(origin)) return cb(null, true);
     cb(new Error(`CORS: origine non autorisée — ${origin}`));
   },
@@ -734,14 +736,32 @@ serversRouter.post<ServerIdParams>('/:serverId/join',
         return res.status(403).json({ error: 'Vous êtes banni de ce serveur' });
       }
 
-      // Vérifier si le serveur est public, en découverte approuvée, ou si l'utilisateur a un code d'invitation
-      if (!server.is_public && !inviteCode) {
+      // Serveur public, en découverte approuvée, ou code d'invitation VALIDE
+      // pour CE serveur. La seule présence d'un `inviteCode` (n'importe
+      // lequel) suffisait auparavant à rejoindre un serveur privé.
+      let usedInviteId: string | null = null;
+      if (!server.is_public) {
         const [discoverRows] = await db.query(
           "SELECT id FROM server_applications WHERE server_id = ? AND status = 'approved' LIMIT 1",
           [serverId]
         );
         if ((discoverRows as any[]).length === 0) {
-          return res.status(403).json({ error: 'Ce serveur nécessite une invitation' });
+          if (typeof inviteCode !== 'string' || !inviteCode) {
+            return res.status(403).json({ error: 'Ce serveur nécessite une invitation' });
+          }
+          const [invRows] = await db.query<RowDataPacket[]>(
+            'SELECT id, expires_at, max_uses, uses FROM server_invites WHERE server_id = ? AND (code = ? OR custom_slug = ?) LIMIT 1',
+            [serverId, inviteCode, inviteCode]
+          );
+          const inv = (invRows as any[])[0];
+          if (!inv) return res.status(403).json({ error: 'Invitation invalide pour ce serveur' });
+          if (inv.expires_at && new Date(inv.expires_at) < new Date()) {
+            return res.status(410).json({ error: 'Cette invitation a expiré' });
+          }
+          if (inv.max_uses && inv.uses >= inv.max_uses) {
+            return res.status(410).json({ error: 'Cette invitation a atteint son nombre maximum d\'utilisations' });
+          }
+          usedInviteId = inv.id;
         }
       }
 
@@ -764,11 +784,15 @@ serversRouter.post<ServerIdParams>('/:serverId/join',
       const roleIds = defaultRole.length > 0 ? [(defaultRole as any[])[0].id] : [];
 
       // Ajouter le membre
-      await db.execute(
+      const insert: any = await db.execute(
         `INSERT IGNORE INTO server_members (server_id, user_id, role_ids)
          VALUES (?, ?, ?)`,
         [serverId, userId, JSON.stringify(roleIds)]
       );
+      const inserted = Number((Array.isArray(insert) ? insert[0] : insert)?.affectedRows ?? 0) > 0;
+      if (inserted && usedInviteId) {
+        await db.execute('UPDATE server_invites SET uses = uses + 1 WHERE id = ?', [usedInviteId]);
+      }
 
       logger.info(`${userId} a rejoint le serveur ${serverId}`);
 
@@ -1374,6 +1398,26 @@ serversRouter.patch('/:serverId/members/:userId', authMiddleware, async (req: Au
       if (await isOwner(userId, serverId)) {
         return res.status(403).json({ error: 'Impossible de modifier les rôles du propriétaire' });
       }
+      // Hiérarchie : pas sur un membre plus puissant que soi.
+      if (userId !== actorId && !(await canActOn(actorId, userId, serverId))) {
+        return res.status(403).json({ error: 'Ce membre a des permissions supérieures aux vôtres' });
+      }
+      // Uniquement des rôles existants DE CE serveur.
+      if (!Array.isArray(roleIds) || roleIds.length > 50 || !roleIds.every((r: unknown) => typeof r === 'string')) {
+        return res.status(400).json({ error: 'roleIds invalide' });
+      }
+      if (roleIds.length > 0) {
+        const [known] = await getDb().query<RowDataPacket[]>(
+          `SELECT id FROM roles WHERE server_id = ? AND id IN (${roleIds.map(() => '?').join(',')})`,
+          [serverId, ...roleIds]
+        );
+        if ((known as any[]).length !== new Set(roleIds).size) {
+          return res.status(400).json({ error: 'Rôle inconnu dans ce serveur' });
+        }
+      }
+    }
+    if (nickname !== undefined && (nickname !== null && (typeof nickname !== 'string' || nickname.length > 32))) {
+      return res.status(400).json({ error: 'nickname invalide' });
     }
     if (nickname !== undefined && actorId !== userId) {
       if (!(await hasPermission(actorId, serverId, PERM.ADMIN))) {
@@ -1764,14 +1808,20 @@ serversRouter.delete('/invites/:inviteId', authMiddleware, async (req: AuthReque
 // ============ REJOINDRE PAR CODE D'INVITATION ============
 
 serversRouter.post('/join',
-  body('inviteCode').isString().isLength({ min: 1 }),
-  body('userId').optional().isUUID(),
+  authMiddleware,
+  body('inviteCode').isString().isLength({ min: 1, max: 64 }),
   async (req, res) => {
     try {
       const errors = validationResult(req);
       if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
-      const { inviteCode, userId } = req.body;
+      // L'utilisateur qui rejoint est l'appelant authentifié, jamais un
+      // `userId` du corps : la route, sans authentification, permettait
+      // d'inscrire n'importe quel compte sur n'importe quel serveur.
+      const { inviteCode } = req.body;
+      const authUserId = (req as AuthRequest).userId;
+      const userId = authUserId && authUserId !== 'internal' ? authUserId : null;
+      if (!userId) return res.status(401).json({ error: 'Authentification requise' });
       const db = getDb();
 
       // Chercher par code OU par slug personnalisé
@@ -2295,8 +2345,10 @@ serversRouter.get<ServerIdParams>('/:serverId/node-token', authMiddleware, async
   try {
     const { serverId } = req.params;
     const userId = req.userId!;
-    if (!(await hasPermission(userId, serverId, PERM.ADMIN))) {
-      return res.status(403).json({ error: 'Admin requis' });
+    // Le jeton de node donne le contrôle du plan de données du serveur
+    // (diffusions, stockage des messages) : réservé au propriétaire.
+    if (!(await isOwner(userId, serverId))) {
+      return res.status(403).json({ error: 'Réservé au propriétaire du serveur' });
     }
     const db = getDb();
     const [servers] = await db.query('SELECT node_token FROM servers WHERE id = ?', [serverId]);
@@ -2404,9 +2456,17 @@ serversRouter.post<ServerIdParams>('/:serverId/claim-admin', authMiddleware, asy
       return res.status(400).json({ error: 'code requis' });
     }
 
-    // Atomic GETDEL pour éviter le TOCTOU (deux users claim simultanément)
-    const storedCode = await redis.getdel(`setup_code:${serverId}`);
-    if (!storedCode || storedCode.toUpperCase() !== String(code).toUpperCase()) {
+    // Comparer AVANT de consommer : le GETDEL inconditionnel laissait n'importe
+    // quel essai erroné détruire le code légitime de l'hébergeur. Le DEL ne
+    // renvoie 1 qu'au premier appelant : un seul gagnant en cas de course.
+    const storedCode = await redis.get(`setup_code:${serverId}`);
+    const given = String(code).toUpperCase();
+    const a = Buffer.from(String(storedCode ?? '').toUpperCase());
+    const b = Buffer.from(given);
+    if (!storedCode || a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      return res.status(403).json({ error: 'Code invalide ou expiré' });
+    }
+    if ((await redis.del(`setup_code:${serverId}`)) !== 1) {
       return res.status(403).json({ error: 'Code invalide ou expiré' });
     }
 
@@ -3718,28 +3778,38 @@ app.use('/servers', serversRouter);
 const UPLOADS_DIR = path.resolve(process.env.UPLOADS_DIR || './uploads/server-files');
 if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 
-const fileStorage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, UPLOADS_DIR),
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(null, `${uuidv4()}${ext}`);
-  },
-});
+
+// Extension DÉRIVÉE du type déclaré, jamais reprise du nom d'origine : un
+// `.html` / `.svg` / `.js` envoyé comme « image » ou « text/plain » était
+// ensuite servi avec un Content-Type exécutable depuis le domaine de l'API.
+const FILE_EXT_BY_MIME: Record<string, string> = {
+  'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp', 'image/avif': 'avif',
+  'video/mp4': 'mp4', 'video/webm': 'webm', 'video/ogg': 'ogv',
+  'audio/mpeg': 'mp3', 'audio/ogg': 'ogg', 'audio/webm': 'weba', 'audio/wav': 'wav', 'audio/mp4': 'm4a',
+  'application/pdf': 'pdf', 'text/plain': 'txt',
+};
+
+function storedFileName(mimetype: string): string {
+  return `${uuidv4()}.${FILE_EXT_BY_MIME[mimetype] ?? 'bin'}`;
+}
 
 const fileUpload = multer({
-  storage: fileStorage,
-  limits: { fileSize: 50 * 1024 * 1024 },
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, UPLOADS_DIR),
+    filename: (_req, file, cb) => cb(null, storedFileName(file.mimetype)),
+  }),
+  limits: { fileSize: 50 * 1024 * 1024, files: 1 },
   fileFilter: (_req, file, cb) => {
-    const allowed = ['image/', 'video/', 'audio/', 'application/pdf', 'text/plain'];
-    if (allowed.some((t) => file.mimetype.startsWith(t))) cb(null, true);
+    if (FILE_EXT_BY_MIME[file.mimetype]) cb(null, true);
     else cb(new Error('Type de fichier non autorisé'));
   },
 });
 
-// POST /servers/:serverId/files — upload (utilisé en fallback sans node)
-app.post('/servers/:serverId/files', authMiddleware, fileUpload.single('file'), (req: Request, res: Response) => {
+// POST /servers/:serverId/files — upload (utilisé en fallback sans node).
+// Réservé aux membres : n'importe quel compte pouvait déposer 50 Mo sur
+// n'importe quel serveur (hébergement de fichiers gratuit sur le domaine).
+app.post('/servers/:serverId/files', authMiddleware, requireMember, fileUpload.single('file'), (req: Request, res: Response) => {
   if (!req.file) return res.status(400).json({ error: 'Aucun fichier fourni' });
-  const { serverId } = req.params;
   res.status(201).json({
     id: uuidv4(),
     url: `/files/${req.file.filename}`,
@@ -3757,6 +3827,15 @@ app.get('/servers/:serverId/files/:filename', (req: Request, res: Response) => {
     return res.status(403).json({ error: 'Accès refusé' });
   }
   if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Fichier non trouvé' });
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox");
+  const ext = path.extname(filename).slice(1).toLowerCase();
+  const inline = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'avif', 'mp4', 'webm', 'ogv', 'mp3', 'ogg', 'weba', 'wav', 'm4a', 'pdf'].includes(ext);
+  if (!inline) {
+    res.setHeader('Content-Disposition', 'attachment');
+    res.type('application/octet-stream');
+    return res.sendFile(filePath);
+  }
   res.sendFile(filePath);
 });
 
