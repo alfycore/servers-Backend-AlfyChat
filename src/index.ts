@@ -2592,6 +2592,36 @@ serversRouter.get('/public/list', async (req, res) => {
   }
 });
 
+// Aperçu d'UN serveur public (liens courts alfy.chat/s/ID). Doit rester après
+// /public/list. Un serveur privé répond 404, comme s'il n'existait pas.
+serversRouter.get('/public/:serverId', async (req, res) => {
+  try {
+    const db = getDb();
+    const [rows] = await db.query(
+      `SELECT s.id, s.name, s.description, s.icon_url, s.banner_url, COUNT(sm.user_id) AS member_count
+       FROM servers s
+       LEFT JOIN server_members sm ON s.id = sm.server_id
+       WHERE s.id = ? AND s.is_public = TRUE
+       GROUP BY s.id`,
+      [req.params.serverId],
+    );
+    const server = (rows as any[])[0];
+    if (!server) return res.status(404).json({ error: 'Serveur introuvable' });
+
+    res.json({
+      id: server.id,
+      name: server.name,
+      description: server.description ?? null,
+      iconUrl: server.icon_url ?? null,
+      bannerUrl: server.banner_url ?? null,
+      memberCount: Number(server.member_count) || 0,
+    });
+  } catch (error) {
+    logger.error('Erreur aperçu serveur public:', error);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
 // ============ DÉCOUVERTE DE SERVEURS & BADGES ============
 
 // Admin: liste tous les serveurs avec statut badges (pour panneau admin)
