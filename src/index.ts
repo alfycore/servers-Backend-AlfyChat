@@ -4279,13 +4279,46 @@ serversRouter.post('/webhooks/:webhookId/:token',
       const webhook = rows[0];
 
       const { content, username, avatarUrl } = req.body;
+      // Un contenu fait d'espaces passait `isLength({ min: 1 })` ; un `username`
+      // non textuel faisait planter `.slice()` (500 au lieu de 400).
+      if (!content.trim()) return res.status(400).json({ error: 'Contenu invalide', code: 'EMPTY_CONTENT' });
+      if (username !== undefined && username !== null && (typeof username !== 'string' || !username.trim() || username.length > 80)) {
+        return res.status(400).json({ error: 'Nom invalide (1 à 80 caractères)', code: 'INVALID_USERNAME' });
+      }
+      if (avatarUrl !== undefined && avatarUrl !== null && (typeof avatarUrl !== 'string' || avatarUrl.length > 500 || !/^https?:\/\//i.test(avatarUrl))) {
+        return res.status(400).json({ error: 'URL d\'avatar invalide (http(s), 500 caractères max)', code: 'INVALID_AVATAR_URL' });
+      }
+
       const messageId = uuidv4();
+      const name = (typeof username === 'string' && username.trim() ? username.trim() : webhook.name).slice(0, 80);
+      const avatar = (typeof avatarUrl === 'string' && avatarUrl) || webhook.avatar_url || null;
       await db.execute(
         `INSERT INTO server_messages (id, channel_id, server_id, content, webhook_id, webhook_name, webhook_avatar_url)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [messageId, webhook.channel_id, webhook.server_id, content, webhookId, (username || webhook.name).slice(0, 80), avatarUrl || webhook.avatar_url || null]
+        [messageId, webhook.channel_id, webhook.server_id, content, webhookId, name, avatar]
       );
-      res.status(201).json({ id: messageId, channelId: webhook.channel_id, serverId: webhook.server_id, content });
+      // Même forme que l'historique : la passerelle diffuse ce message tel quel
+      // au salon (SERVER_MESSAGE_NEW), il s'affiche donc sans rechargement.
+      const now = new Date().toISOString();
+      res.status(201).json({
+        id: messageId,
+        channelId: webhook.channel_id,
+        serverId: webhook.server_id,
+        senderId: null,
+        senderName: name,
+        senderAvatar: avatar,
+        isWebhook: true,
+        sender: { id: null, username: name, displayName: name, avatarUrl: avatar ?? undefined },
+        content,
+        attachments: [],
+        isEdited: false,
+        isPinned: false,
+        replyToId: null,
+        forumTags: [],
+        reactions: [],
+        createdAt: now,
+        updatedAt: now,
+      });
     } catch (error) {
       logger.error('Erreur envoi message webhook:', error);
       res.status(500).json({ error: 'Erreur serveur' });
