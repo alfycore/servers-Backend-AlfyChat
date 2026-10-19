@@ -101,7 +101,7 @@ interface ServerIdParams extends Record<string, string> {
 // (`gateway/src/utils/permissions.ts`). Trois définitions divergentes
 // coexistaient auparavant, avec deux sémantiques opposées (ET côté gateway,
 // OU ici) : une permission accordée d'un côté pouvait être ignorée de l'autre.
-import { PERM as PERM_FLAGS, ALL_PERMS_MASK, KICK_ANY, BAN_ANY, normalizePerms } from './permissions';
+import { PERM as PERM_FLAGS, ALL_PERMS_MASK, KICK_ANY, BAN_ANY, normalizePerms, DEFAULT_EVERYONE_PERMS, V2_BASELINE_GRANT } from './permissions';
 
 const PERM = { ...PERM_FLAGS, ALL: ALL_PERMS_MASK } as const;
 
@@ -138,47 +138,199 @@ async function isOwner(userId: string, serverId: string): Promise<boolean> {
  * Sert aux contrôles anti-escalade : on ne peut jamais accorder un bit qu'on n'a pas.
  */
 async function getUserPermBits(userId: string, serverId: string): Promise<{ isOwner: boolean; perms: number }> {
+  const ctx = await getMemberContext(userId, serverId);
+  return { isOwner: ctx.isOwner, perms: ctx.perms };
+}
+
+interface MemberContext {
+  isOwner: boolean;
+  isMember: boolean;
+  /** Rôles explicites du membre (hors @everyone). */
+  roleIds: string[];
+  defaultRoleId: string | null;
+  /** Bits cumulés @everyone + rôles (ADMIN étendu à tout). */
+  perms: number;
+}
+
+/**
+ * Contexte de permission d'un membre.
+ *
+ * Le rôle par défaut (@everyone) s'applique TOUJOURS, comme sur Discord :
+ * auparavant il n'était lu que pour un membre sans aucun rôle, si bien
+ * qu'attribuer un rôle « Modérateur » (sans READ) rendait le membre aveugle.
+ */
+async function getMemberContext(userId: string, serverId: string): Promise<MemberContext> {
   const db = getDb();
+  const none: MemberContext = { isOwner: false, isMember: false, roleIds: [], defaultRoleId: null, perms: 0 };
   const [serverRows] = await db.query<RowDataPacket[]>('SELECT owner_id FROM servers WHERE id = ?', [serverId]);
-  if (!(serverRows as any[]).length) return { isOwner: false, perms: 0 };
-  if ((serverRows as any[])[0].owner_id === userId) return { isOwner: true, perms: PERM.ALL };
+  if (!(serverRows as any[]).length) return none;
+  const [defaultRows] = await db.query<RowDataPacket[]>(
+    'SELECT id, permissions FROM roles WHERE server_id = ? AND is_default = TRUE LIMIT 1', [serverId]
+  );
+  const defaultRole = (defaultRows as any[])[0];
+  const defaultRoleId: string | null = defaultRole?.id ?? null;
+
+  if ((serverRows as any[])[0].owner_id === userId) {
+    return { isOwner: true, isMember: true, roleIds: [], defaultRoleId, perms: PERM.ALL };
+  }
 
   const [memberRows] = await db.query<RowDataPacket[]>(
     'SELECT role_ids FROM server_members WHERE server_id = ? AND user_id = ?', [serverId, userId]
   );
-  if (!(memberRows as any[]).length) return { isOwner: false, perms: 0 };
+  if (!(memberRows as any[]).length) return { ...none, defaultRoleId };
 
   let roleIds: string[];
   try {
     const raw = (memberRows as any[])[0].role_ids;
     roleIds = typeof raw === 'string' ? JSON.parse(raw) : raw || [];
   } catch { roleIds = []; }
+  if (!Array.isArray(roleIds)) roleIds = [];
+  roleIds = roleIds.filter((id) => typeof id === 'string' && id !== defaultRoleId);
 
-  let roles: RowDataPacket[];
-  if (!Array.isArray(roleIds) || !roleIds.length) {
-    // Membre sans rôle explicite : il hérite du rôle par défaut du serveur.
-    // Les membres ajoutés avant la colonne `role_ids`, et ceux d'un serveur
-    // sans rôle par défaut, se retrouvaient sinon avec 0 permission — donc
-    // muets et privés d'historique alors qu'ils sont bien membres.
-    const [defaultRoles] = await db.query<RowDataPacket[]>(
-      'SELECT permissions FROM roles WHERE server_id = ? AND is_default = TRUE LIMIT 1', [serverId]
-    );
-    roles = defaultRoles as RowDataPacket[];
-  } else {
+  let perms = defaultRole ? normalizePerms(defaultRole.permissions) : 0;
+  if (roleIds.length) {
     const placeholders = roleIds.map(() => '?').join(',');
     const [named] = await db.query<RowDataPacket[]>(
       `SELECT permissions FROM roles WHERE id IN (${placeholders}) AND server_id = ?`, [...roleIds, serverId]
     );
-    roles = named as RowDataPacket[];
-  }
-
-  let perms = 0;
-  for (const role of roles as any[]) {
-    perms |= normalizePerms(role.permissions);
+    for (const role of named as any[]) perms |= normalizePerms(role.permissions);
   }
   // ADMIN vaut tout : l'expliciter évite d'avoir à le retester partout.
   if (perms & PERM.ADMIN) perms = PERM.ALL;
-  return { isOwner: false, perms };
+  return { isOwner: false, isMember: true, roleIds, defaultRoleId, perms };
+}
+
+interface OverrideRow { targetType: 'role' | 'member'; targetId: string; allow: number; deny: number }
+
+function mapOverride(r: any): OverrideRow {
+  return {
+    targetType: r.target_type === 'member' ? 'member' : 'role',
+    targetId: r.target_id,
+    allow: normalizePerms(Number(r.allow_bits)),
+    deny: normalizePerms(Number(r.deny_bits)),
+  };
+}
+
+/**
+ * Applique les surcharges d'un salon aux bits de base — algorithme Discord :
+ * @everyone, puis l'union des rôles du membre (refus puis accords), puis la
+ * surcharge propre au membre. ADMIN et le propriétaire ignorent tout.
+ */
+function applyOverrides(ctx: MemberContext, userId: string, overrides: OverrideRow[]): number {
+  if (ctx.isOwner || (ctx.perms & PERM.ADMIN)) return PERM.ALL;
+  let perms = ctx.perms;
+  const everyone = overrides.find((o) => o.targetType === 'role' && o.targetId === ctx.defaultRoleId);
+  if (everyone) perms = (perms & ~everyone.deny) | everyone.allow;
+  let roleAllow = 0;
+  let roleDeny = 0;
+  for (const o of overrides) {
+    if (o.targetType === 'role' && o.targetId !== ctx.defaultRoleId && ctx.roleIds.includes(o.targetId)) {
+      roleAllow |= o.allow;
+      roleDeny |= o.deny;
+    }
+  }
+  perms = (perms & ~roleDeny) | roleAllow;
+  const member = overrides.find((o) => o.targetType === 'member' && o.targetId === userId);
+  if (member) perms = (perms & ~member.deny) | member.allow;
+  return perms & PERM.ALL;
+}
+
+/**
+ * Surcharges effectives d'un salon : les siennes, ou celles de sa catégorie
+ * quand il n'en a aucune (salon « synchronisé avec la catégorie »).
+ */
+function effectiveOverrides(
+  channel: { id: string; parent_id?: string | null },
+  byChannel: Map<string, OverrideRow[]>,
+): OverrideRow[] {
+  const own = byChannel.get(channel.id);
+  if (own && own.length) return own;
+  if (channel.parent_id) return byChannel.get(channel.parent_id) ?? [];
+  return [];
+}
+
+async function loadServerOverrides(serverId: string): Promise<Map<string, OverrideRow[]>> {
+  const [rows] = await getDb().query<RowDataPacket[]>(
+    'SELECT channel_id, target_type, target_id, allow_bits, deny_bits FROM channel_overrides WHERE server_id = ?', [serverId]
+  );
+  const map = new Map<string, OverrideRow[]>();
+  for (const r of rows as any[]) {
+    const list = map.get(r.channel_id) ?? [];
+    list.push(mapOverride(r));
+    map.set(r.channel_id, list);
+  }
+  return map;
+}
+
+/** Bits d'un membre DANS un salon (surcharges appliquées). */
+async function getChannelPermBits(userId: string, serverId: string, channelId: string): Promise<{ isOwner: boolean; isMember: boolean; perms: number }> {
+  const ctx = await getMemberContext(userId, serverId);
+  if (!ctx.isMember) return { isOwner: false, isMember: false, perms: 0 };
+  if (ctx.isOwner || (ctx.perms & PERM.ADMIN)) return { isOwner: ctx.isOwner, isMember: true, perms: PERM.ALL };
+  const [chRows] = await getDb().query<RowDataPacket[]>(
+    'SELECT id, parent_id FROM channels WHERE id = ? AND server_id = ?', [channelId, serverId]
+  );
+  const channel = (chRows as any[])[0];
+  if (!channel) return { isOwner: false, isMember: true, perms: 0 };
+  const overrides = await loadServerOverrides(serverId);
+  return { isOwner: false, isMember: true, perms: applyOverrides(ctx, userId, effectiveOverrides(channel, overrides)) };
+}
+
+/** Rang hiérarchique le plus haut d'un membre (position max de ses rôles). */
+async function topRolePosition(userId: string, serverId: string): Promise<number> {
+  const ctx = await getMemberContext(userId, serverId);
+  if (ctx.isOwner) return Number.MAX_SAFE_INTEGER;
+  if (!ctx.roleIds.length) return 0;
+  const placeholders = ctx.roleIds.map(() => '?').join(',');
+  const [rows] = await getDb().query<RowDataPacket[]>(
+    `SELECT MAX(position) AS top FROM roles WHERE server_id = ? AND id IN (${placeholders})`, [serverId, ...ctx.roleIds]
+  );
+  return Number((rows as any[])[0]?.top ?? 0);
+}
+
+/** Forme publique d'un salon — la même partout (REST, broadcast WS). */
+function mapChannel(ch: any) {
+  return {
+    id: ch.id,
+    serverId: ch.server_id,
+    name: ch.name,
+    type: ch.type,
+    position: ch.position,
+    parentId: ch.parent_id,
+    topic: ch.topic,
+    isNsfw: Boolean(ch.is_nsfw),
+    slowMode: Number(ch.slow_mode ?? 0),
+    userLimit: Number(ch.user_limit ?? 0),
+  };
+}
+
+/** Forme publique d'un rôle. */
+function mapRole(r: any) {
+  return {
+    id: r.id,
+    serverId: r.server_id,
+    name: r.name,
+    color: r.color,
+    permissions: normalizePerms(r.permissions),
+    position: r.position,
+    isDefault: Boolean(r.is_default),
+    hoist: Boolean(r.hoist),
+    mentionable: Boolean(r.mentionable),
+    iconEmoji: r.icon_emoji ?? null,
+    iconUrl: r.icon_url ?? null,
+  };
+}
+
+async function fetchChannel(serverId: string, channelId: string) {
+  const [rows] = await getDb().query<RowDataPacket[]>('SELECT * FROM channels WHERE id = ? AND server_id = ?', [channelId, serverId]);
+  const ch = (rows as any[])[0];
+  return ch ? mapChannel(ch) : null;
+}
+
+async function fetchRole(serverId: string, roleId: string) {
+  const [rows] = await getDb().query<RowDataPacket[]>('SELECT * FROM roles WHERE id = ? AND server_id = ?', [roleId, serverId]);
+  const r = (rows as any[])[0];
+  return r ? mapRole(r) : null;
 }
 
 /**
@@ -667,23 +819,8 @@ serversRouter.get('/:serverId', authMiddleware, requireMember, async (req, res) 
       maxMembers: server.max_members || 100,
       createdAt: server.created_at,
       updatedAt: server.updated_at,
-      channels: (channels as any[]).map((ch: any) => ({
-        id: ch.id,
-        serverId: ch.server_id,
-        name: ch.name,
-        type: ch.type,
-        position: ch.position,
-        parentId: ch.parent_id,
-        topic: ch.topic,
-      })),
-      roles: (roles as any[]).map((r: any) => ({
-        id: r.id,
-        serverId: r.server_id,
-        name: r.name,
-        color: r.color,
-        permissions: r.permissions,
-        position: r.position,
-      })),
+      channels: (channels as any[]).map(mapChannel),
+      roles: (roles as any[]).map(mapRole),
       members: (members as any[]).map((m: any) => ({
         id: m.id,
         userId: m.user_id,
@@ -850,22 +987,28 @@ serversRouter.post<ServerIdParams>('/:serverId/leave',
 serversRouter.get<ServerIdParams>('/:serverId/channels', authMiddleware, requireMember, async (req, res) => {
   try {
     const { serverId } = req.params;
+    const userId = (req as AuthRequest).userId!;
     const db = getDb();
     const [channels] = await db.query(
       'SELECT * FROM channels WHERE server_id = ? ORDER BY position',
       [serverId]
     );
-    res.json(
-      (channels as any[]).map((ch: any) => ({
-        id: ch.id,
-        serverId: ch.server_id,
-        name: ch.name,
-        type: ch.type,
-        position: ch.position,
-        parentId: ch.parent_id,
-        topic: ch.topic,
-      }))
-    );
+    const all = channels as any[];
+    // Appel interne (gateway sans identité) : liste complète, sert aux
+    // contrôles d'appartenance d'un salon à son serveur.
+    if (userId === 'internal') return res.json(all.map(mapChannel));
+
+    // Pour un membre : seuls les salons qu'il peut voir (READ après
+    // surcharges), et les catégories qui en contiennent au moins un ou qu'il
+    // voit elles-mêmes — comme la liste de salons de Discord.
+    const ctx = await getMemberContext(userId, serverId);
+    if (ctx.isOwner || (ctx.perms & PERM.ADMIN)) return res.json(all.map(mapChannel));
+    const overrides = await loadServerOverrides(serverId);
+    const canSee = (ch: any) => (applyOverrides(ctx, userId, effectiveOverrides(ch, overrides)) & PERM.READ) !== 0;
+    const visible = all.filter((ch) => ch.type !== 'category' && canSee(ch));
+    const visibleParents = new Set(visible.map((ch) => ch.parent_id).filter(Boolean));
+    const cats = all.filter((ch) => ch.type === 'category' && (visibleParents.has(ch.id) || canSee(ch)));
+    res.json([...cats, ...visible].sort((a, b) => (a.position ?? 0) - (b.position ?? 0)).map(mapChannel));
   } catch (error) {
     logger.error('Erreur récupération channels:', error);
     res.status(500).json({ error: 'Erreur serveur' });
@@ -889,7 +1032,7 @@ serversRouter.post<ServerIdParams>('/:serverId/channels',
         return res.status(403).json({ error: 'Permission insuffisante — MANAGE_CHANNELS requis' });
       }
 
-      const { name, type, parentId } = req.body;
+      const { name, type, parentId, topic, isNsfw, slowMode, userLimit, isPrivate } = req.body;
       const db = getDb();
       const channelId = uuidv4();
 
@@ -899,10 +1042,17 @@ serversRouter.post<ServerIdParams>('/:serverId/channels',
         return res.status(404).json({ error: 'Serveur introuvable' });
       }
 
-      // Les catégories ne peuvent pas avoir de parent
-      const resolvedParentId = type === 'category' ? null : (parentId || null);
+      // Les catégories ne peuvent pas avoir de parent ; un parent doit être
+      // une catégorie DE CE serveur.
+      let resolvedParentId: string | null = type === 'category' ? null : (parentId || null);
+      if (resolvedParentId) {
+        const [parentRows] = await db.query<RowDataPacket[]>(
+          "SELECT id FROM channels WHERE id = ? AND server_id = ? AND type = 'category'", [resolvedParentId, serverId]
+        );
+        if (!(parentRows as any[]).length) resolvedParentId = null;
+      }
 
-      // Récupérer la position max
+      // Nouveau salon : en fin de sa catégorie (ou en fin de liste).
       const [maxPos] = await db.query(
         'SELECT MAX(position) as maxPos FROM channels WHERE server_id = ?',
         [serverId]
@@ -910,20 +1060,37 @@ serversRouter.post<ServerIdParams>('/:serverId/channels',
       const position = ((maxPos as any[])[0].maxPos || 0) + 1;
 
       await db.execute(
-        `INSERT INTO channels (id, server_id, name, type, position, parent_id)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [channelId, serverId, name, type, position, resolvedParentId]
+        `INSERT INTO channels (id, server_id, name, type, position, parent_id, topic, is_nsfw, slow_mode, user_limit)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          channelId, serverId, name, type, position, resolvedParentId,
+          typeof topic === 'string' ? topic.slice(0, 1024) : null,
+          Boolean(isNsfw),
+          Math.min(Math.max(Number(slowMode) || 0, 0), 21_600),
+          Math.min(Math.max(Number(userLimit) || 0, 0), 99),
+        ]
       );
+
+      // Salon privé : @everyone ne le voit plus, le créateur oui (comme le
+      // commutateur « Salon privé » de Discord).
+      if (isPrivate === true) {
+        const ctx = await getMemberContext(actorId, serverId);
+        if (ctx.defaultRoleId) {
+          await db.execute(
+            `INSERT INTO channel_overrides (channel_id, server_id, target_type, target_id, allow_bits, deny_bits) VALUES (?, ?, 'role', ?, 0, ?)`,
+            [channelId, serverId, ctx.defaultRoleId, PERM.READ | PERM.CONNECT]
+          );
+        }
+        if (actorId !== 'internal') {
+          await db.execute(
+            `INSERT INTO channel_overrides (channel_id, server_id, target_type, target_id, allow_bits, deny_bits) VALUES (?, ?, 'member', ?, ?, 0)`,
+            [channelId, serverId, actorId, PERM.READ | PERM.SEND | PERM.CONNECT | PERM.SPEAK]
+          );
+        }
+      }
       await logAudit(serverId, actorId, 'channel_create', { type: 'channel', id: channelId }, { name, channelType: type });
 
-      res.status(201).json({
-        id: channelId,
-        serverId,
-        name,
-        type,
-        position,
-        parentId: resolvedParentId,
-      });
+      res.status(201).json(await fetchChannel(serverId, channelId));
     } catch (error) {
       logger.error('Erreur création channel:', error);
       res.status(500).json({ error: 'Erreur serveur' });
@@ -939,28 +1106,41 @@ serversRouter.patch('/:serverId/channels/:channelId', authMiddleware, async (req
       return res.status(403).json({ error: 'Permission insuffisante — MANAGE_CHANNELS requis' });
     }
 
-    const { name, topic, position, isNsfw, slowMode, parentId } = req.body;
+    const { name, topic, position, isNsfw, slowMode, parentId, userLimit } = req.body;
     const db = getDb();
+
+    // Le salon doit appartenir à CE serveur : sans ce contrôle, MANAGE_CHANNELS
+    // sur un serveur suffisait à renommer/supprimer les salons de n'importe quel autre.
+    const current = await fetchChannel(serverId, channelId);
+    if (!current) return res.status(404).json({ error: 'Salon introuvable dans ce serveur' });
 
     const updates: string[] = [];
     const params: any[] = [];
 
-    if (name !== undefined) { updates.push('name = ?'); params.push(name); }
-    if (topic !== undefined) { updates.push('topic = ?'); params.push(topic); }
-    if (position !== undefined) { updates.push('position = ?'); params.push(position); }
-    if (isNsfw !== undefined) { updates.push('is_nsfw = ?'); params.push(isNsfw); }
-    if (slowMode !== undefined) { updates.push('slow_mode = ?'); params.push(slowMode); }
-    if (parentId !== undefined) { updates.push('parent_id = ?'); params.push(parentId || null); }
-
-    if (updates.length > 0) {
-      params.push(channelId);
-      await db.execute(`UPDATE channels SET ${updates.join(', ')} WHERE id = ?`, params);
-      if (name !== undefined) {
-        await logAudit(serverId, actorId, 'channel_update', { type: 'channel', id: channelId }, { name });
+    if (name !== undefined) { updates.push('name = ?'); params.push(String(name).slice(0, 100)); }
+    if (topic !== undefined) { updates.push('topic = ?'); params.push(topic === null ? null : String(topic).slice(0, 1024)); }
+    if (position !== undefined) { updates.push('position = ?'); params.push(Math.max(0, Number(position) || 0)); }
+    if (isNsfw !== undefined) { updates.push('is_nsfw = ?'); params.push(Boolean(isNsfw)); }
+    if (slowMode !== undefined) { updates.push('slow_mode = ?'); params.push(Math.min(Math.max(Number(slowMode) || 0, 0), 21_600)); }
+    if (userLimit !== undefined) { updates.push('user_limit = ?'); params.push(Math.min(Math.max(Number(userLimit) || 0, 0), 99)); }
+    if (parentId !== undefined && current.type !== 'category') {
+      let next: string | null = parentId || null;
+      if (next) {
+        const [parentRows] = await db.query<RowDataPacket[]>(
+          "SELECT id FROM channels WHERE id = ? AND server_id = ? AND type = 'category'", [next, serverId]
+        );
+        if (!(parentRows as any[]).length) next = null;
       }
+      updates.push('parent_id = ?'); params.push(next);
     }
 
-    res.json({ success: true });
+    if (updates.length > 0) {
+      params.push(channelId, serverId);
+      await db.execute(`UPDATE channels SET ${updates.join(', ')} WHERE id = ? AND server_id = ?`, params);
+      await logAudit(serverId, actorId, 'channel_update', { type: 'channel', id: channelId }, { fields: Object.keys(req.body).filter((k) => k !== 'userId') });
+    }
+
+    res.json(await fetchChannel(serverId, channelId));
   } catch (error) {
     logger.error('Erreur modification channel:', error);
     res.status(500).json({ error: 'Erreur serveur' });
@@ -976,15 +1156,231 @@ serversRouter.delete('/:serverId/channels/:channelId', authMiddleware, async (re
     }
 
     const db = getDb();
-    await db.execute('DELETE FROM channels WHERE id = ?', [channelId]);
-    await logAudit(serverId, actorId, 'channel_delete', { type: 'channel', id: channelId });
+    const current = await fetchChannel(serverId, channelId);
+    if (!current) return res.status(404).json({ error: 'Salon introuvable dans ce serveur' });
+    await db.transaction(async (conn) => {
+      await conn.execute('DELETE FROM channels WHERE id = ? AND server_id = ?', [channelId, serverId]);
+      // Supprimer une catégorie ne supprime pas ses salons : ils remontent hors catégorie.
+      await conn.execute('UPDATE channels SET parent_id = NULL WHERE parent_id = ? AND server_id = ?', [channelId, serverId]);
+      await conn.execute('DELETE FROM channel_overrides WHERE channel_id = ? AND server_id = ?', [channelId, serverId]);
+    });
+    await logAudit(serverId, actorId, 'channel_delete', { type: 'channel', id: channelId }, { name: current.name });
 
-    res.json({ success: true });
+    res.json({ success: true, channelId, name: current.name, type: current.type });
   } catch (error) {
     logger.error('Erreur suppression channel:', error);
     res.status(500).json({ error: 'Erreur serveur' });
   }
 });
+
+// ============ RÉORGANISATION DES SALONS (glisser-déposer) ============
+
+/**
+ * Applique en une transaction un lot de positions/catégories — un seul aller-
+ * retour pour un glisser-déposer, au lieu d'un PATCH par salon déplacé (qui
+ * laissait la liste dans un ordre incohérent le temps que tout arrive).
+ */
+serversRouter.patch<ServerIdParams>('/:serverId/channels', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const { serverId } = req.params;
+    const actorId = req.userId!;
+    if (!(await hasPermission(actorId, serverId, PERM.MANAGE_CHANNELS))) {
+      return res.status(403).json({ error: 'Permission insuffisante — MANAGE_CHANNELS requis' });
+    }
+    const positions = Array.isArray(req.body?.positions) ? req.body.positions : null;
+    if (!positions || positions.length === 0 || positions.length > 500) {
+      return res.status(400).json({ error: 'positions invalide' });
+    }
+    const db = getDb();
+    const [rows] = await db.query<RowDataPacket[]>('SELECT id, type FROM channels WHERE server_id = ?', [serverId]);
+    const known = new Map((rows as any[]).map((r) => [r.id as string, r.type as string]));
+
+    const clean: { id: string; position: number; parentId?: string | null }[] = [];
+    for (const row of positions) {
+      if (typeof row?.id !== 'string' || !known.has(row.id)) {
+        return res.status(400).json({ error: 'Salon inconnu dans ce serveur' });
+      }
+      const position = Math.max(0, Math.floor(Number(row.position)));
+      if (!Number.isFinite(position)) return res.status(400).json({ error: 'position invalide' });
+      const entry: { id: string; position: number; parentId?: string | null } = { id: row.id, position };
+      if (row.parentId !== undefined && known.get(row.id) !== 'category') {
+        const parent = row.parentId || null;
+        if (parent !== null && known.get(parent) !== 'category') {
+          return res.status(400).json({ error: 'parentId doit désigner une catégorie de ce serveur' });
+        }
+        entry.parentId = parent;
+      }
+      clean.push(entry);
+    }
+
+    await db.transaction(async (conn) => {
+      for (const row of clean) {
+        if (row.parentId !== undefined) {
+          await conn.execute('UPDATE channels SET position = ?, parent_id = ? WHERE id = ? AND server_id = ?', [row.position, row.parentId, row.id, serverId]);
+        } else {
+          await conn.execute('UPDATE channels SET position = ? WHERE id = ? AND server_id = ?', [row.position, row.id, serverId]);
+        }
+      }
+    });
+    await logAudit(serverId, actorId, 'channel_reorder', { type: 'server', id: serverId }, { count: clean.length });
+
+    const [after] = await db.query('SELECT * FROM channels WHERE server_id = ? ORDER BY position', [serverId]);
+    res.json({ serverId, channels: (after as any[]).map(mapChannel) });
+  } catch (error) {
+    logger.error('Erreur réorganisation salons:', error);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// ============ SURCHARGES DE PERMISSIONS PAR SALON ============
+
+serversRouter.get('/:serverId/channels/:channelId/overrides', authMiddleware, requireMember, async (req, res) => {
+  try {
+    const { serverId, channelId } = req.params;
+    if (!(await channelInServer(channelId, serverId))) return res.status(404).json({ error: 'Salon introuvable dans ce serveur' });
+    const [rows] = await getDb().query<RowDataPacket[]>(
+      'SELECT target_type, target_id, allow_bits, deny_bits FROM channel_overrides WHERE channel_id = ? AND server_id = ?',
+      [channelId, serverId]
+    );
+    const [chRows] = await getDb().query<RowDataPacket[]>('SELECT parent_id FROM channels WHERE id = ?', [channelId]);
+    const parentId = (chRows as any[])[0]?.parent_id ?? null;
+    res.json({ channelId, parentId, synced: (rows as any[]).length === 0 && !!parentId, overrides: (rows as any[]).map(mapOverride) });
+  } catch (error) {
+    logger.error('Erreur lecture surcharges:', error);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+serversRouter.put('/:serverId/channels/:channelId/overrides', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const { serverId, channelId } = req.params;
+    const actorId = req.userId!;
+    if (!(await hasPermission(actorId, serverId, PERM.MANAGE_CHANNELS | PERM.MANAGE_ROLES))) {
+      return res.status(403).json({ error: 'Permission insuffisante — MANAGE_CHANNELS requis' });
+    }
+    if (!(await channelInServer(channelId, serverId))) return res.status(404).json({ error: 'Salon introuvable dans ce serveur' });
+
+    const targetType = req.body?.targetType === 'member' ? 'member' : req.body?.targetType === 'role' ? 'role' : null;
+    const targetId = typeof req.body?.targetId === 'string' ? req.body.targetId : '';
+    if (!targetType || !targetId) return res.status(400).json({ error: 'targetType/targetId requis' });
+
+    const db = getDb();
+    if (targetType === 'role') {
+      const [r] = await db.query<RowDataPacket[]>('SELECT 1 FROM roles WHERE id = ? AND server_id = ?', [targetId, serverId]);
+      if (!(r as any[]).length) return res.status(404).json({ error: 'Rôle introuvable dans ce serveur' });
+    } else {
+      const [m] = await db.query<RowDataPacket[]>(
+        'SELECT 1 FROM server_members WHERE user_id = ? AND server_id = ? UNION SELECT 1 FROM servers WHERE id = ? AND owner_id = ?',
+        [targetId, serverId, serverId, targetId]
+      );
+      if (!(m as any[]).length) return res.status(404).json({ error: 'Membre introuvable dans ce serveur' });
+    }
+
+    // ADMIN n'a pas de sens dans une surcharge ; un refus l'emporte sur un accord.
+    let deny = normalizePerms(Number(req.body?.deny) || 0) & ~PERM.ADMIN;
+    let allow = normalizePerms(Number(req.body?.allow) || 0) & ~PERM.ADMIN & ~deny;
+
+    // Anti-escalade : on ne peut accorder ou refuser dans un salon que des
+    // droits qu'on y possède soi-même.
+    if (actorId !== 'internal') {
+      const actor = await getChannelPermBits(actorId, serverId, channelId);
+      if (!actor.isOwner && ((allow | deny) & ~actor.perms)) {
+        return res.status(403).json({ error: 'Vous ne pouvez pas modifier des droits que vous ne possédez pas' });
+      }
+    }
+
+    await db.execute(
+      `INSERT INTO channel_overrides (channel_id, server_id, target_type, target_id, allow_bits, deny_bits)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE allow_bits = VALUES(allow_bits), deny_bits = VALUES(deny_bits)`,
+      [channelId, serverId, targetType, targetId, allow, deny]
+    );
+    await logAudit(serverId, actorId, 'channel_override_update', { type: 'channel', id: channelId }, { targetType, targetId, allow, deny });
+    res.json({ channelId, override: { targetType, targetId, allow, deny } });
+  } catch (error) {
+    logger.error('Erreur écriture surcharge:', error);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+serversRouter.delete('/:serverId/channels/:channelId/overrides/:targetType/:targetId', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const { serverId, channelId, targetType, targetId } = req.params;
+    const actorId = req.userId!;
+    if (!(await hasPermission(actorId, serverId, PERM.MANAGE_CHANNELS | PERM.MANAGE_ROLES))) {
+      return res.status(403).json({ error: 'Permission insuffisante — MANAGE_CHANNELS requis' });
+    }
+    if (targetType !== 'role' && targetType !== 'member') return res.status(400).json({ error: 'targetType invalide' });
+    await getDb().execute(
+      'DELETE FROM channel_overrides WHERE channel_id = ? AND server_id = ? AND target_type = ? AND target_id = ?',
+      [channelId, serverId, targetType, targetId]
+    );
+    await logAudit(serverId, actorId, 'channel_override_delete', { type: 'channel', id: channelId }, { targetType, targetId });
+    res.json({ success: true, channelId, targetType, targetId });
+  } catch (error) {
+    logger.error('Erreur suppression surcharge:', error);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+/** Resynchronise un salon avec sa catégorie : ses surcharges propres disparaissent. */
+serversRouter.post('/:serverId/channels/:channelId/overrides/sync', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const { serverId, channelId } = req.params;
+    const actorId = req.userId!;
+    if (!(await hasPermission(actorId, serverId, PERM.MANAGE_CHANNELS))) {
+      return res.status(403).json({ error: 'Permission insuffisante — MANAGE_CHANNELS requis' });
+    }
+    if (!(await channelInServer(channelId, serverId))) return res.status(404).json({ error: 'Salon introuvable dans ce serveur' });
+    await getDb().execute('DELETE FROM channel_overrides WHERE channel_id = ? AND server_id = ?', [channelId, serverId]);
+    res.json({ success: true, channelId });
+  } catch (error) {
+    logger.error('Erreur synchronisation surcharges:', error);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
+// ============ RÉORGANISATION DES RÔLES ============
+
+serversRouter.patch<ServerIdParams>('/:serverId/roles', authMiddleware, async (req: AuthRequest, res) => {
+  try {
+    const { serverId } = req.params;
+    const actorId = req.userId!;
+    if (!(await hasPermission(actorId, serverId, PERM.MANAGE_ROLES))) {
+      return res.status(403).json({ error: 'Permission insuffisante — MANAGE_ROLES requis' });
+    }
+    const positions = Array.isArray(req.body?.positions) ? req.body.positions : null;
+    if (!positions || positions.length === 0 || positions.length > 250) return res.status(400).json({ error: 'positions invalide' });
+
+    const db = getDb();
+    const [rows] = await db.query<RowDataPacket[]>('SELECT id, position, is_default FROM roles WHERE server_id = ?', [serverId]);
+    const byId = new Map((rows as any[]).map((r) => [r.id as string, r]));
+    // Un non-propriétaire ne touche qu'aux rôles strictement sous le sien, et
+    // ne peut pas en faire remonter un au-dessus.
+    const top = await topRolePosition(actorId, serverId);
+    for (const row of positions) {
+      const current = byId.get(row?.id);
+      const next = Math.floor(Number(row?.position));
+      if (!current || !Number.isFinite(next) || next < 1) return res.status(400).json({ error: 'Rôle ou position invalide' });
+      if (current.is_default) return res.status(400).json({ error: 'Le rôle @everyone reste en bas' });
+      if (Number(current.position) >= top || next >= top) {
+        return res.status(403).json({ error: 'Ce rôle est au-dessus du vôtre dans la hiérarchie' });
+      }
+    }
+    await db.transaction(async (conn) => {
+      for (const row of positions) {
+        await conn.execute('UPDATE roles SET position = ? WHERE id = ? AND server_id = ?', [Math.floor(Number(row.position)), row.id, serverId]);
+      }
+    });
+    await logAudit(serverId, actorId, 'role_reorder', { type: 'server', id: serverId }, { count: positions.length });
+    const [after] = await db.query('SELECT * FROM roles WHERE server_id = ? ORDER BY position DESC', [serverId]);
+    res.json({ serverId, roles: (after as any[]).map(mapRole) });
+  } catch (error) {
+    logger.error('Erreur réorganisation rôles:', error);
+    res.status(500).json({ error: 'Erreur serveur' });
+  }
+});
+
 
 // ============ GÉRER LES RÔLES ============
 
@@ -1001,7 +1397,7 @@ serversRouter.post<ServerIdParams>('/:serverId/roles',
         return res.status(403).json({ error: 'Permission insuffisante — MANAGE_ROLES requis' });
       }
 
-      const { name, color = '#99AAB5', permissions = 0 } = req.body;
+      const { name, color = '#99AAB5', permissions = 0, hoist = false, mentionable = false, iconEmoji = null } = req.body;
       // Masquer les permissions à la plage valide — jamais stocker la valeur brute du client
       let safePermissions = (Number(permissions) || 0) & PERM.ALL;
 
@@ -1026,13 +1422,14 @@ serversRouter.post<ServerIdParams>('/:serverId/roles',
       const position = ((maxPos as any[])[0].maxPos || 0) + 1;
 
       await db.execute(
-        `INSERT INTO roles (id, server_id, name, color, position, permissions)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [roleId, serverId, name, color, position, JSON.stringify(safePermissions)]
+        `INSERT INTO roles (id, server_id, name, color, position, permissions, hoist, mentionable, icon_emoji)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [roleId, serverId, name, color, position, JSON.stringify(safePermissions), Boolean(hoist), Boolean(mentionable),
+          typeof iconEmoji === 'string' && iconEmoji ? iconEmoji.slice(0, 16) : null]
       );
       await logAudit(serverId, actorId, 'role_create', { type: 'role', id: roleId }, { name });
 
-      res.status(201).json({ id: roleId, name, color, position, permissions: safePermissions });
+      res.status(201).json(await fetchRole(serverId, roleId));
     } catch (error) {
       logger.error('Erreur création rôle:', error);
       res.status(500).json({ error: 'Erreur serveur' });
@@ -1049,6 +1446,47 @@ const PLATFORM_MAX_MEMBERS: Record<'standard' | 'community', number> = {
   community: 4000,
 };
 const PLATFORM_QUOTA = { total: 5, community: 2, standard: 3 } as const;
+
+/**
+ * Modèles de création (« Créer un serveur » de Discord) : chaque modèle est une
+ * liste de catégories et de leurs salons. `default` = « Créer le mien ».
+ */
+type TemplateChannel = { name: string; type: 'text' | 'voice' | 'announcement' | 'forum' };
+const SERVER_TEMPLATES: Record<string, { name: string; channels: TemplateChannel[] }[]> = {
+  default: [
+    { name: 'Salons textuels', channels: [{ name: 'général', type: 'text' }] },
+    { name: 'Salons vocaux', channels: [{ name: 'Général', type: 'voice' }] },
+  ],
+  gaming: [
+    { name: 'Infos', channels: [{ name: 'bienvenue-et-règles', type: 'text' }, { name: 'annonces', type: 'announcement' }] },
+    { name: 'Salons textuels', channels: [{ name: 'général', type: 'text' }, { name: 'clips-et-highlights', type: 'text' }, { name: 'recherche-de-groupe', type: 'text' }] },
+    { name: 'Salons vocaux', channels: [{ name: 'Salon', type: 'voice' }, { name: 'Gaming', type: 'voice' }] },
+  ],
+  friends: [
+    { name: 'Salons textuels', channels: [{ name: 'général', type: 'text' }, { name: 'jeux', type: 'text' }, { name: 'musique', type: 'text' }] },
+    { name: 'Salons vocaux', channels: [{ name: 'Salon', type: 'voice' }, { name: 'Stream', type: 'voice' }] },
+  ],
+  study: [
+    { name: 'Bienvenue', channels: [{ name: 'bienvenue-et-règles', type: 'text' }, { name: 'notes-et-ressources', type: 'text' }] },
+    { name: 'Salons textuels', channels: [{ name: 'général', type: 'text' }, { name: 'aide-aux-devoirs', type: 'text' }, { name: 'planning-de-session', type: 'text' }, { name: 'hors-sujet', type: 'text' }] },
+    { name: 'Salons vocaux', channels: [{ name: 'Salon', type: 'voice' }, { name: "Salle d'étude 1", type: 'voice' }, { name: "Salle d'étude 2", type: 'voice' }] },
+  ],
+  school: [
+    { name: 'Infos', channels: [{ name: 'bienvenue-et-règles', type: 'text' }, { name: 'annonces', type: 'announcement' }, { name: 'ressources', type: 'text' }] },
+    { name: 'Salons textuels', channels: [{ name: 'général', type: 'text' }, { name: 'réunions', type: 'text' }, { name: 'hors-sujet', type: 'text' }] },
+    { name: 'Salons vocaux', channels: [{ name: 'Salon', type: 'voice' }, { name: 'Salle de réunion', type: 'voice' }] },
+  ],
+  creators: [
+    { name: 'Infos', channels: [{ name: 'bienvenue-et-règles', type: 'text' }, { name: 'annonces', type: 'announcement' }] },
+    { name: 'Salons textuels', channels: [{ name: 'général', type: 'text' }, { name: 'événements', type: 'text' }, { name: 'idées-et-retours', type: 'forum' }] },
+    { name: 'Salons vocaux', channels: [{ name: 'Salon', type: 'voice' }, { name: 'Salle de collab', type: 'voice' }, { name: 'Stream', type: 'voice' }] },
+  ],
+  community: [
+    { name: 'Infos', channels: [{ name: 'bienvenue-et-règles', type: 'text' }, { name: 'annonces', type: 'announcement' }, { name: 'ressources', type: 'text' }] },
+    { name: 'Salons textuels', channels: [{ name: 'général', type: 'text' }, { name: 'présentations', type: 'text' }, { name: 'événements', type: 'text' }, { name: 'hors-sujet', type: 'text' }] },
+    { name: 'Salons vocaux', channels: [{ name: 'Salon', type: 'voice' }, { name: "Salle d'événements", type: 'voice' }] },
+  ],
+};
 
 serversRouter.post('/',
   authMiddleware,
@@ -1091,8 +1529,15 @@ serversRouter.post('/',
       const serverId = uuidv4();
       const nodeToken = uuidv4();
       const defaultRoleId = uuidv4();
-      const generalChannelId = uuidv4();
-      const voiceChannelId = uuidv4();
+      const template = SERVER_TEMPLATES[String(req.body.template ?? 'default')] ?? SERVER_TEMPLATES.default;
+      // Plan à plat : catégories puis leurs salons, positions croissantes.
+      const plan: { id: string; name: string; type: string; parentId: string | null; position: number }[] = [];
+      let pos = 0;
+      for (const cat of template) {
+        const catId = uuidv4();
+        plan.push({ id: catId, name: cat.name, type: 'category', parentId: null, position: pos++ });
+        for (const ch of cat.channels) plan.push({ id: uuidv4(), name: ch.name, type: ch.type, parentId: catId, position: pos++ });
+      }
 
       await db.transaction(async (conn) => {
         await conn.execute(
@@ -1102,17 +1547,15 @@ serversRouter.post('/',
         );
         await conn.execute(
           `INSERT INTO roles (id, server_id, name, color, is_default, position, permissions)
-           VALUES (?, ?, 'Membre', '#99AAB5', TRUE, 0, ?)`,
-          [defaultRoleId, serverId, JSON.stringify(0x7)]  // READ|SEND|REACT = 0x7
+           VALUES (?, ?, '@everyone', '#99AAB5', TRUE, 0, ?)`,
+          [defaultRoleId, serverId, JSON.stringify(DEFAULT_EVERYONE_PERMS)]
         );
-        await conn.execute(
-          `INSERT INTO channels (id, server_id, name, type, position) VALUES (?, ?, 'général', 'text', 0)`,
-          [generalChannelId, serverId]
-        );
-        await conn.execute(
-          `INSERT INTO channels (id, server_id, name, type, position) VALUES (?, ?, 'Vocal', 'voice', 1)`,
-          [voiceChannelId, serverId]
-        );
+        for (const ch of plan) {
+          await conn.execute(
+            `INSERT INTO channels (id, server_id, name, type, position, parent_id) VALUES (?, ?, ?, ?, ?, ?)`,
+            [ch.id, serverId, ch.name, ch.type, ch.position, ch.parentId]
+          );
+        }
         await conn.execute(
           `INSERT INTO server_members (server_id, user_id, role_ids) VALUES (?, ?, ?)`,
           [serverId, ownerId, JSON.stringify([defaultRoleId])]
@@ -1133,10 +1576,8 @@ serversRouter.post('/',
         hostingType: 'platform',
         category,
         maxMembers,
-        channels: [
-          { id: generalChannelId, name: 'général', type: 'text' },
-          { id: voiceChannelId, name: 'Vocal', type: 'voice' },
-        ],
+        channels: plan.map((ch) => ({ id: ch.id, serverId, name: ch.name, type: ch.type, parentId: ch.parentId, position: ch.position })),
+        firstChannelId: plan.find((ch) => ch.type === 'text')?.id ?? null,
       });
     } catch (error) {
       logger.error('Erreur création serveur:', error);
@@ -1152,9 +1593,9 @@ serversRouter.patch<ServerIdParams>('/:serverId', authMiddleware, async (req: Au
     const { serverId } = req.params;
     const userId = req.userId!;
 
-    // Seul le owner ou un admin peut modifier le serveur
-    if (!(await hasPermission(userId, serverId, PERM.ADMIN))) {
-      return res.status(403).json({ error: 'Permission insuffisante — ADMIN requis' });
+    // Propriétaire, ADMIN ou MANAGE_SERVER (« Gérer le serveur » de Discord).
+    if (!(await hasPermission(userId, serverId, PERM.MANAGE_SERVER))) {
+      return res.status(403).json({ error: 'Permission insuffisante — MANAGE_SERVER requis' });
     }
 
     const { name, description, iconUrl, bannerUrl, isPublic, category, verificationLevel, require2faModeration, restrictEmojiUsage } = req.body;
@@ -1303,6 +1744,12 @@ serversRouter.get('/:serverId/members/:userId/permissions', authMiddleware, asyn
     );
     if (!serverRows.length) return res.status(404).json({ error: 'Serveur non trouvé' });
 
+    const channelId = typeof req.query.channelId === 'string' ? req.query.channelId : '';
+    if (channelId) {
+      const ch = await getChannelPermBits(userId, serverId, channelId);
+      return res.json({ isMember: ch.isMember, isOwner: ch.isOwner, permissions: ch.perms, channelId });
+    }
+
     const bits = await getUserPermBits(userId, serverId);
     if (bits.isOwner) {
       return res.json({ isMember: true, isOwner: true, permissions: PERM.ALL });
@@ -1391,8 +1838,8 @@ serversRouter.patch('/:serverId/members/:userId', authMiddleware, async (req: Au
     // Modifier des rôles (les siens ou ceux d'un autre) nécessite toujours ADMIN —
     // sans quoi un membre pourrait s'auto-attribuer un rôle plus élevé
     if (roleIds !== undefined) {
-      if (!(await hasPermission(actorId, serverId, PERM.ADMIN))) {
-        return res.status(403).json({ error: 'Permission insuffisante — ADMIN requis pour modifier les rôles' });
+      if (!(await hasPermission(actorId, serverId, PERM.MANAGE_ROLES))) {
+        return res.status(403).json({ error: 'Permission insuffisante — MANAGE_ROLES requis pour modifier les rôles' });
       }
       // Empêcher de modifier les rôles du owner
       if (await isOwner(userId, serverId)) {
@@ -1415,14 +1862,41 @@ serversRouter.patch('/:serverId/members/:userId', authMiddleware, async (req: Au
           return res.status(400).json({ error: 'Rôle inconnu dans ce serveur' });
         }
       }
+      // Hiérarchie Discord : un non-propriétaire ne donne ni ne retire un rôle
+      // situé au niveau du sien ou au-dessus, ni un rôle aux droits supérieurs.
+      if (actorId !== 'internal') {
+        const actor = await getMemberContext(actorId, serverId);
+        if (!actor.isOwner) {
+          const before = (await getMemberContext(userId, serverId)).roleIds;
+          const changed = [...new Set([...before.filter((r) => !roleIds.includes(r)), ...roleIds.filter((r: string) => !before.includes(r))])];
+          if (changed.length) {
+            const top = await topRolePosition(actorId, serverId);
+            const [rows] = await getDb().query<RowDataPacket[]>(
+              `SELECT id, position, permissions FROM roles WHERE server_id = ? AND id IN (${changed.map(() => '?').join(',')})`,
+              [serverId, ...changed]
+            );
+            for (const r of rows as any[]) {
+              if (Number(r.position) >= top || (normalizePerms(r.permissions) & ~actor.perms)) {
+                return res.status(403).json({ error: 'Ce rôle est au-dessus du vôtre dans la hiérarchie' });
+              }
+            }
+          }
+        }
+      }
     }
     if (nickname !== undefined && (nickname !== null && (typeof nickname !== 'string' || nickname.length > 32))) {
       return res.status(400).json({ error: 'nickname invalide' });
     }
-    if (nickname !== undefined && actorId !== userId) {
-      if (!(await hasPermission(actorId, serverId, PERM.ADMIN))) {
-        return res.status(403).json({ error: 'Permission insuffisante pour modifier le nickname d\'un autre membre' });
+    if (nickname !== undefined && actorId !== userId && actorId !== 'internal') {
+      if (!(await hasPermission(actorId, serverId, PERM.MANAGE_NICKNAMES))) {
+        return res.status(403).json({ error: 'Permission insuffisante — MANAGE_NICKNAMES requis' });
       }
+      if (!(await canActOn(actorId, userId, serverId))) {
+        return res.status(403).json({ error: 'Ce membre a des permissions supérieures aux vôtres' });
+      }
+    }
+    if (nickname !== undefined && actorId === userId && !(await hasPermission(actorId, serverId, PERM.CHANGE_NICKNAME | PERM.MANAGE_NICKNAMES))) {
+      return res.status(403).json({ error: 'Permission insuffisante — CHANGE_NICKNAME requis' });
     }
 
     const db = getDb();
@@ -1449,7 +1923,10 @@ serversRouter.patch('/:serverId/members/:userId', authMiddleware, async (req: Au
     if (roleIds !== undefined) {
       await logAudit(serverId, actorId, 'member_role_update', { type: 'user', id: userId }, { roleIds });
     }
-    res.json({ success: true });
+    if (nickname !== undefined) {
+      await logAudit(serverId, actorId, 'member_nickname_update', { type: 'user', id: userId }, { nickname });
+    }
+    res.json({ success: true, serverId, userId, ...(roleIds !== undefined ? { roleIds } : {}), ...(nickname !== undefined ? { nickname } : {}) });
   } catch (error) {
     logger.error('Erreur modification membre:', error);
     res.status(500).json({ error: 'Erreur serveur' });
@@ -1551,18 +2028,7 @@ serversRouter.get<ServerIdParams>('/:serverId/roles', authMiddleware, requireMem
       'SELECT * FROM roles WHERE server_id = ? ORDER BY position DESC',
       [serverId]
     );
-    const mapped = (roles as any[]).map((r: any) => ({
-      id: r.id,
-      serverId: r.server_id,
-      name: r.name,
-      color: r.color,
-      permissions: r.permissions,
-      position: r.position,
-      isDefault: Boolean(r.is_default),
-      iconEmoji: r.icon_emoji,
-      iconUrl: r.icon_url,
-    }));
-    res.json(mapped);
+    res.json((roles as any[]).map(mapRole));
   } catch (error) {
     res.status(500).json({ error: 'Erreur serveur' });
   }
@@ -1578,7 +2044,7 @@ serversRouter.patch('/:serverId/roles/:roleId', authMiddleware, async (req, res)
       return res.status(403).json({ error: 'Permission insuffisante — MANAGE_ROLES requis' });
     }
 
-    const { name, color, permissions, iconEmoji, iconUrl, position } = req.body;
+    const { name, color, permissions, iconEmoji, iconUrl, position, hoist, mentionable } = req.body;
     const db = getDb();
 
     // Le rôle doit appartenir à CE serveur — sans quoi un roleId suffit à toucher
@@ -1623,6 +2089,8 @@ serversRouter.patch('/:serverId/roles/:roleId', authMiddleware, async (req, res)
     if (iconEmoji !== undefined) { updates.push('icon_emoji = ?'); params.push(iconEmoji); }
     if (iconUrl !== undefined) { updates.push('icon_url = ?'); params.push(iconUrl); }
     if (safePosition !== undefined) { updates.push('position = ?'); params.push(safePosition); }
+    if (hoist !== undefined) { updates.push('hoist = ?'); params.push(Boolean(hoist)); }
+    if (mentionable !== undefined) { updates.push('mentionable = ?'); params.push(Boolean(mentionable)); }
 
     if (updates.length > 0) {
       params.push(roleId, serverId);
@@ -1630,7 +2098,7 @@ serversRouter.patch('/:serverId/roles/:roleId', authMiddleware, async (req, res)
       await logAudit(serverId, actorId, 'role_update', { type: 'role', id: roleId }, { fields: Object.keys(req.body) });
     }
 
-    res.json({ success: true, id: roleId, permissions: safePermissions });
+    res.json({ success: true, ...(await fetchRole(serverId, roleId)) });
   } catch (error) {
     logger.error('Erreur modification rôle:', error);
     res.status(500).json({ error: 'Erreur serveur' });
@@ -1705,8 +2173,11 @@ serversRouter.post<ServerIdParams>('/:serverId/invites', authMiddleware, async (
       'SELECT user_id FROM server_members WHERE server_id = ? AND user_id = ?',
       [serverId, creatorId]
     );
-    if ((memberCheck as any[]).length === 0) {
+    if ((memberCheck as any[]).length === 0 && !(await isOwner(creatorId, serverId))) {
       return res.status(403).json({ error: 'Vous devez être membre du serveur pour créer une invitation' });
+    }
+    if (creatorId !== 'internal' && !(await hasPermission(creatorId, serverId, PERM.CREATE_INVITE))) {
+      return res.status(403).json({ error: 'Permission insuffisante — CREATE_INVITE requis' });
     }
 
     if (!creatorId) {
@@ -3022,7 +3493,7 @@ serversRouter.get('/:serverId/events',
 serversRouter.post('/:serverId/events',
   authMiddleware,
   requireMember,
-  requirePerm(PERM.MANAGE_CHANNELS, 'MANAGE_CHANNELS'),
+  requirePerm(PERM.MANAGE_CHANNELS | PERM.MANAGE_EVENTS, 'MANAGE_EVENTS'),
   body('title').isString().isLength({ min: 1, max: 200 }),
   body('startsAt').isISO8601(),
   body('type').isIn(['voice', 'stage', 'external']),
@@ -3086,7 +3557,7 @@ serversRouter.post('/:serverId/events/:eventId/interest',
 serversRouter.patch('/:serverId/events/:eventId',
   authMiddleware,
   requireMember,
-  requirePerm(PERM.MANAGE_CHANNELS, 'MANAGE_CHANNELS'),
+  requirePerm(PERM.MANAGE_CHANNELS | PERM.MANAGE_EVENTS, 'MANAGE_EVENTS'),
   body('status').optional().isIn(['scheduled', 'active', 'ended', 'canceled']),
   body('title').optional().isString().isLength({ max: 200 }),
   async (req: AuthRequest, res) => {
@@ -3122,7 +3593,7 @@ serversRouter.patch('/:serverId/events/:eventId',
 serversRouter.delete('/:serverId/events/:eventId',
   authMiddleware,
   requireMember,
-  requirePerm(PERM.MANAGE_CHANNELS, 'MANAGE_CHANNELS'),
+  requirePerm(PERM.MANAGE_CHANNELS | PERM.MANAGE_EVENTS, 'MANAGE_EVENTS'),
   async (req: AuthRequest, res) => {
     try {
       const { serverId, eventId } = req.params;
@@ -3151,7 +3622,7 @@ serversRouter.delete('/:serverId/events/:eventId',
 serversRouter.get('/:serverId/automod',
   authMiddleware,
   requireMember,
-  requirePerm(PERM.ADMIN, 'ADMIN'),
+  requirePerm(PERM.ADMIN | PERM.MANAGE_SERVER, 'MANAGE_SERVER'),
   async (req: AuthRequest, res) => {
     try {
       const { serverId } = req.params;
@@ -3174,7 +3645,7 @@ serversRouter.get('/:serverId/automod',
 serversRouter.post('/:serverId/automod',
   authMiddleware,
   requireMember,
-  requirePerm(PERM.ADMIN, 'ADMIN'),
+  requirePerm(PERM.ADMIN | PERM.MANAGE_SERVER, 'MANAGE_SERVER'),
   body('name').isString().isLength({ min: 1, max: 100 }),
   body('triggerType').isIn(['keyword', 'spam', 'mention_spam', 'link', 'invite']),
   body('actionType').isIn(['block', 'alert', 'timeout', 'delete']),
@@ -3209,7 +3680,7 @@ serversRouter.post('/:serverId/automod',
 serversRouter.patch('/:serverId/automod/:ruleId',
   authMiddleware,
   requireMember,
-  requirePerm(PERM.ADMIN, 'ADMIN'),
+  requirePerm(PERM.ADMIN | PERM.MANAGE_SERVER, 'MANAGE_SERVER'),
   body('enabled').optional().isBoolean(),
   body('name').optional().isString().isLength({ max: 100 }),
   body('triggerMetadata').optional().isObject(),
@@ -3245,7 +3716,7 @@ serversRouter.patch('/:serverId/automod/:ruleId',
 serversRouter.delete('/:serverId/automod/:ruleId',
   authMiddleware,
   requireMember,
-  requirePerm(PERM.ADMIN, 'ADMIN'),
+  requirePerm(PERM.ADMIN | PERM.MANAGE_SERVER, 'MANAGE_SERVER'),
   async (req: AuthRequest, res) => {
     try {
       const { serverId, ruleId } = req.params;
@@ -3290,7 +3761,8 @@ serversRouter.post('/:serverId/automod/check',
             }
           }
         } else if (rule.trigger_type === 'invite') {
-          if (/discord\.gg\/\w+/i.test(content)) {
+          // Invitations AlfyChat (lien court, ancien format /invite/) et Discord.
+          if (/(alfy\.chat\/(i\/)?[\w-]{4,}|\/invite\/[\w-]{4,}|discord\.gg\/\w+|discord(app)?\.com\/invite\/\w+)/i.test(content)) {
             if (rule.action_type === 'block' || rule.action_type === 'delete') {
               return res.json({ blocked: true, reason: 'invite_link', action: rule.action_type });
             }
@@ -3301,6 +3773,16 @@ serversRouter.post('/:serverId/automod/check',
               return res.json({ blocked: true, reason: 'link_violation', action: rule.action_type });
             }
           }
+        }
+      }
+      // Mentions en masse : au-delà du seuil de la règle (défaut 5).
+      for (const rule of rules as any[]) {
+        if (rule.trigger_type !== 'mention_spam') continue;
+        const meta = typeof rule.trigger_metadata === 'string' ? JSON.parse(rule.trigger_metadata) : rule.trigger_metadata;
+        const limit = Math.max(1, Number(meta?.mentionLimit) || 5);
+        const count = (content.match(/@[\p{L}\p{N}_.-]{2,32}/gu) ?? []).length;
+        if (count > limit && (rule.action_type === 'block' || rule.action_type === 'delete')) {
+          return res.json({ blocked: true, reason: 'mention_spam', action: rule.action_type });
         }
       }
       res.json({ blocked: false, reason: null });
@@ -3508,7 +3990,7 @@ serversRouter.post('/:serverId/emojis',
 
       const { serverId } = req.params;
       const actorId = req.userId!;
-      if (!(await hasPermission(actorId, serverId, PERM.MANAGE_CHANNELS))) {
+      if (!(await hasPermission(actorId, serverId, PERM.MANAGE_CHANNELS | PERM.MANAGE_EMOJIS))) {
         return res.status(403).json({ error: 'Permission insuffisante — MANAGE_CHANNELS requis' });
       }
 
@@ -3542,7 +4024,7 @@ serversRouter.delete('/:serverId/emojis/:emojiId', authMiddleware, async (req: A
   try {
     const { serverId, emojiId } = req.params;
     const actorId = req.userId!;
-    if (!(await hasPermission(actorId, serverId, PERM.MANAGE_CHANNELS))) {
+    if (!(await hasPermission(actorId, serverId, PERM.MANAGE_CHANNELS | PERM.MANAGE_EMOJIS))) {
       return res.status(403).json({ error: 'Permission insuffisante — MANAGE_CHANNELS requis' });
     }
     const db = getDb();
@@ -3561,7 +4043,7 @@ serversRouter.get('/:serverId/audit-logs', authMiddleware, async (req: AuthReque
   try {
     const { serverId } = req.params;
     const actorId = req.userId!;
-    if (!(await hasPermission(actorId, serverId, PERM.ADMIN))) {
+    if (!(await hasPermission(actorId, serverId, PERM.ADMIN | PERM.VIEW_AUDIT_LOG))) {
       return res.status(403).json({ error: 'Permission insuffisante — ADMIN requis' });
     }
     const limit = Math.min(Number(req.query.limit) || 50, 100);
@@ -3601,7 +4083,7 @@ serversRouter.get('/:serverId/audit-logs', authMiddleware, async (req: AuthReque
 serversRouter.get('/:serverId/security', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const { serverId } = req.params;
-    if (!(await hasPermission(req.userId!, serverId, PERM.ADMIN))) {
+    if (!(await hasPermission(req.userId!, serverId, PERM.ADMIN | PERM.MANAGE_SERVER))) {
       return res.status(403).json({ error: 'Permission insuffisante — ADMIN requis' });
     }
     const [rows] = await getDb().query<RowDataPacket[]>(
@@ -3625,7 +4107,7 @@ serversRouter.get('/:serverId/security', authMiddleware, async (req: AuthRequest
 serversRouter.get('/:serverId/webhooks', authMiddleware, async (req: AuthRequest, res) => {
   try {
     const { serverId } = req.params;
-    if (!(await hasPermission(req.userId!, serverId, PERM.MANAGE_CHANNELS))) {
+    if (!(await hasPermission(req.userId!, serverId, PERM.MANAGE_CHANNELS | PERM.MANAGE_WEBHOOKS))) {
       return res.status(403).json({ error: 'Permission insuffisante — MANAGE_CHANNELS requis' });
     }
     const db = getDb();
@@ -3653,7 +4135,7 @@ serversRouter.post('/:serverId/channels/:channelId/webhooks',
 
       const { serverId, channelId } = req.params;
       const actorId = req.userId!;
-      if (!(await hasPermission(actorId, serverId, PERM.MANAGE_CHANNELS))) {
+      if (!(await hasPermission(actorId, serverId, PERM.MANAGE_CHANNELS | PERM.MANAGE_WEBHOOKS))) {
         return res.status(403).json({ error: 'Permission insuffisante — MANAGE_CHANNELS requis' });
       }
 
@@ -3678,7 +4160,7 @@ serversRouter.delete('/:serverId/webhooks/:webhookId', authMiddleware, async (re
   try {
     const { serverId, webhookId } = req.params;
     const actorId = req.userId!;
-    if (!(await hasPermission(actorId, serverId, PERM.MANAGE_CHANNELS))) {
+    if (!(await hasPermission(actorId, serverId, PERM.MANAGE_CHANNELS | PERM.MANAGE_WEBHOOKS))) {
       return res.status(403).json({ error: 'Permission insuffisante — MANAGE_CHANNELS requis' });
     }
     const db = getDb();
@@ -4266,6 +4748,32 @@ async function start() {
       `ALTER TABLE server_messages ADD COLUMN webhook_id VARCHAR(36) NULL`,
       `ALTER TABLE server_messages ADD COLUMN webhook_name VARCHAR(80) NULL`,
       `ALTER TABLE server_messages ADD COLUMN webhook_avatar_url VARCHAR(500) NULL`,
+
+      // ======================================================
+      // REFONTE « DISCORD » (2026-10-19)
+      // ======================================================
+      // Surcharges de permissions par salon (rôle ou membre), algorithme Discord.
+      `CREATE TABLE IF NOT EXISTS channel_overrides (
+        channel_id VARCHAR(36) NOT NULL,
+        server_id VARCHAR(36) NOT NULL,
+        target_type ENUM('role', 'member') NOT NULL,
+        target_id VARCHAR(36) NOT NULL,
+        allow_bits BIGINT NOT NULL DEFAULT 0,
+        deny_bits BIGINT NOT NULL DEFAULT 0,
+        PRIMARY KEY (channel_id, target_type, target_id),
+        INDEX idx_override_server (server_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+      // Migrations « une seule fois » : les UPDATE de cette liste sont rejoués à
+      // chaque démarrage, ce qui ne convient pas à un octroi de droits.
+      `CREATE TABLE IF NOT EXISTS schema_flags (
+        name VARCHAR(64) PRIMARY KEY,
+        applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
+      // « Afficher les membres de ce rôle séparément » / « Permettre à tous de mentionner ce rôle ».
+      `ALTER TABLE roles ADD COLUMN hoist BOOLEAN DEFAULT FALSE`,
+      `ALTER TABLE roles ADD COLUMN mentionable BOOLEAN DEFAULT FALSE`,
+      // Limite d'utilisateurs d'un salon vocal (0 = illimitée).
+      `ALTER TABLE channels ADD COLUMN user_limit INT DEFAULT 0`,
     ];
 
     for (const sql of migrations) {
@@ -4281,6 +4789,24 @@ async function start() {
           throw err; // Re-lancer pour les CREATE TABLE et erreurs critiques
         }
       }
+    }
+
+    // Extension v2 du bitmask : le rôle @everyone existant reçoit une fois les
+    // nouveaux droits « de base » (vocal, invitations, fichiers, pseudo…), sans
+    // quoi tous les serveurs existants auraient perdu l'accès au vocal.
+    try {
+      const [flag] = await pool.query<RowDataPacket[]>("SELECT 1 FROM schema_flags WHERE name = 'perm_bits_v2'");
+      if (!(flag as any[]).length) {
+        const [defaults] = await pool.query<RowDataPacket[]>('SELECT id, permissions FROM roles WHERE is_default = TRUE');
+        for (const role of defaults as any[]) {
+          const next = normalizePerms(role.permissions) | V2_BASELINE_GRANT;
+          await pool.execute('UPDATE roles SET permissions = ? WHERE id = ?', [JSON.stringify(next), role.id]);
+        }
+        await pool.execute("INSERT INTO schema_flags (name) VALUES ('perm_bits_v2')");
+        logger.info(`Migration perm_bits_v2 : ${(defaults as any[]).length} rôle(s) par défaut mis à jour`);
+      }
+    } catch (err) {
+      logger.error('Migration perm_bits_v2 échouée:', err);
     }
 
     // Lancer le nettoyage périodique
