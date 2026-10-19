@@ -1718,11 +1718,18 @@ serversRouter.get('/:serverId/members/:userId/check', authMiddleware, async (req
     const db = getDb();
 
     const [rows] = await db.query(
-      'SELECT user_id FROM server_members WHERE server_id = ? AND user_id = ?',
+      'SELECT user_id, nickname, role_ids, joined_at FROM server_members WHERE server_id = ? AND user_id = ?',
       [serverId, userId]
     );
 
-    res.json({ isMember: (rows as any[]).length > 0 });
+    const row = (rows as any[])[0];
+    if (!row) return res.json({ isMember: false });
+    let roleIds: string[] = [];
+    try {
+      const parsed = typeof row.role_ids === 'string' ? JSON.parse(row.role_ids) : row.role_ids;
+      if (Array.isArray(parsed)) roleIds = parsed.filter((r: unknown): r is string => typeof r === 'string');
+    } catch { /* role_ids illisible : aucun rôle */ }
+    res.json({ isMember: true, nickname: row.nickname ?? null, roleIds, joinedAt: row.joined_at ?? null });
   } catch (error) {
     logger.error('Erreur vérification membership:', error);
     res.status(500).json({ error: 'Erreur serveur' });
@@ -2302,19 +2309,19 @@ serversRouter.post('/join',
       );
 
       if ((invites as any[]).length === 0) {
-        return res.status(404).json({ error: 'Invitation invalide ou expirée' });
+        return res.status(404).json({ error: 'Invitation invalide ou expirée', code: 'INVITE_NOT_FOUND' });
       }
 
       const invite = (invites as any[])[0];
 
       // Vérifier expiration
       if (invite.expires_at && new Date(invite.expires_at) < new Date()) {
-        return res.status(410).json({ error: 'Cette invitation a expiré' });
+        return res.status(410).json({ error: 'Cette invitation a expiré', code: 'INVITE_EXPIRED' });
       }
 
       // Vérifier max uses
       if (invite.max_uses && invite.uses >= invite.max_uses) {
-        return res.status(410).json({ error: 'Cette invitation a atteint son nombre maximum d\'utilisations' });
+        return res.status(410).json({ error: 'Cette invitation a atteint son nombre maximum d\'utilisations', code: 'INVITE_EXHAUSTED' });
       }
 
       const serverId = invite.server_id;
@@ -2322,10 +2329,11 @@ serversRouter.post('/join',
       // Vérifier que le serveur existe
       const [servers] = await db.query('SELECT * FROM servers WHERE id = ?', [serverId]);
       if ((servers as any[]).length === 0) {
-        return res.status(404).json({ error: 'Serveur introuvable' });
+        return res.status(404).json({ error: 'Serveur introuvable', code: 'SERVER_NOT_FOUND' });
       }
 
       const server = (servers as any[])[0];
+      let alreadyMember = false;
 
       if (userId) {
         // Refuser si l'utilisateur est banni de ce serveur
@@ -2334,7 +2342,7 @@ serversRouter.post('/join',
           [serverId, userId]
         );
         if ((bans as any[]).length > 0) {
-          return res.status(403).json({ error: 'Vous êtes banni de ce serveur' });
+          return res.status(403).json({ error: 'Vous êtes banni de ce serveur', code: 'BANNED' });
         }
 
         // Vérifier si déjà membre
@@ -2343,7 +2351,8 @@ serversRouter.post('/join',
           [serverId, userId]
         );
 
-        if ((existing as any[]).length === 0) {
+        alreadyMember = (existing as any[]).length > 0;
+        if (!alreadyMember) {
           // Plafond de membres — même check que POST /:serverId/join, absent
           // ici jusqu'ici alors que c'est le chemin de jointure dominant
           // (dialogue "Rejoindre", embed d'invitation, page /invite/[code]).
@@ -2352,7 +2361,7 @@ serversRouter.post('/join',
             [serverId]
           );
           if ((memberCount as any[])[0].count >= (server.max_members || 100)) {
-            return res.status(403).json({ error: 'Le serveur est plein' });
+            return res.status(403).json({ error: 'Le serveur est plein', code: 'SERVER_FULL' });
           }
 
           // Récupérer le rôle par défaut
@@ -2388,6 +2397,8 @@ serversRouter.post('/join',
         description: server.description,
         iconUrl: server.icon_url,
         bannerUrl: server.banner_url,
+        ownerId: server.owner_id,
+        alreadyMember,
         channels,
       });
     } catch (error) {
@@ -2398,6 +2409,48 @@ serversRouter.post('/join',
 );
 
 // ============ RÉSOUDRE UNE INVITATION (preview sans rejoindre) ============
+
+/** Utilisateur du jeton, s'il y en a un valide — route publique, auth facultative. */
+function optionalUserId(req: Request): string | null {
+  const header = req.headers.authorization;
+  if (!header?.startsWith('Bearer ')) return null;
+  try {
+    const decoded = jwt.verify(header.slice(7), JWT_SECRET!, { algorithms: ['HS256'] }) as { userId?: string; type?: string };
+    if (decoded.type && decoded.type !== 'access') return null;
+    return typeof decoded.userId === 'string' ? decoded.userId : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Membres en ligne (au moins une socket, statut ni invisible ni hors ligne),
+ * lus dans les clés de présence du gateway — un seul pipeline Redis. Plafonné :
+ * c'est un compteur d'aperçu, pas une liste. `null` si Redis est indisponible.
+ */
+async function countOnlineMembers(userIds: string[]): Promise<number | null> {
+  if (userIds.length === 0) return 0;
+  try {
+    const ids = userIds.slice(0, 5000);
+    const pipe = redis.multi();
+    for (const id of ids) {
+      pipe.get(`presence:${id}`);
+      pipe.scard(`user:sockets:${id}`);
+    }
+    const out = await pipe.exec();
+    let online = 0;
+    ids.forEach((_, i) => {
+      const sockets = Number(out?.[i * 2 + 1]?.[1]) || 0;
+      if (sockets === 0) return;
+      let status = 'online';
+      try { status = JSON.parse(String(out?.[i * 2]?.[1] ?? '{}'))?.status ?? 'online'; } catch { /* présence illisible */ }
+      if (status !== 'invisible' && status !== 'offline') online++;
+    });
+    return online;
+  } catch {
+    return null;
+  }
+}
 
 serversRouter.get('/invite/:code', async (req, res) => {
   try {
@@ -2410,26 +2463,51 @@ serversRouter.get('/invite/:code', async (req, res) => {
     );
 
     if ((invites as any[]).length === 0) {
-      return res.status(404).json({ error: 'Invitation introuvable' });
+      return res.status(404).json({ error: 'Invitation introuvable', code: 'INVITE_NOT_FOUND' });
     }
 
     const invite = (invites as any[])[0];
 
-    // Vérifier expiration
+    // Mêmes refus que la jonction : l'aperçu ne promet pas une invitation
+    // qui échouera au clic.
     if (invite.expires_at && new Date(invite.expires_at) < new Date()) {
-      return res.status(410).json({ error: 'Cette invitation a expiré' });
+      return res.status(410).json({ error: 'Cette invitation a expiré', code: 'INVITE_EXPIRED' });
+    }
+    if (invite.max_uses && invite.uses >= invite.max_uses) {
+      return res.status(410).json({ error: 'Cette invitation a atteint son nombre maximum d\'utilisations', code: 'INVITE_EXHAUSTED' });
     }
 
-    const [servers] = await db.query('SELECT id, name, description, icon_url, banner_url FROM servers WHERE id = ?', [invite.server_id]);
-    if ((servers as any[]).length === 0) {
-      return res.status(404).json({ error: 'Serveur introuvable' });
-    }
-
-    const server = (servers as any[])[0];
-    const [memberCount] = await db.query(
-      'SELECT COUNT(*) as count FROM server_members WHERE server_id = ?',
+    const [servers] = await db.query(
+      'SELECT id, name, description, icon_url, banner_url, owner_id, max_members FROM servers WHERE id = ?',
       [invite.server_id]
     );
+    if ((servers as any[]).length === 0) {
+      return res.status(404).json({ error: 'Serveur introuvable', code: 'SERVER_NOT_FOUND' });
+    }
+    const server = (servers as any[])[0];
+
+    const [memberRows] = await db.query(
+      'SELECT user_id FROM server_members WHERE server_id = ?',
+      [invite.server_id]
+    );
+    const memberIds = (memberRows as any[]).map((m) => String(m.user_id));
+    const memberCount = memberIds.length;
+
+    const [onlineCount, inviterRows] = await Promise.all([
+      countOnlineMembers(memberIds),
+      db.query('SELECT id, username, display_name, avatar_url FROM users WHERE id = ?', [invite.creator_id])
+        .then(([rows]) => rows as any[])
+        .catch(() => [] as any[]),
+    ]);
+    const inviter = inviterRows[0];
+
+    // Visiteur connecté : déjà membre ? banni ? — le bouton s'adapte.
+    const viewerId = optionalUserId(req);
+    let viewer: { isMember: boolean; isBanned: boolean } | null = null;
+    if (viewerId) {
+      const [bans] = await db.query('SELECT 1 FROM server_bans WHERE server_id = ? AND user_id = ?', [invite.server_id, viewerId]);
+      viewer = { isMember: memberIds.includes(viewerId), isBanned: (bans as any[]).length > 0 };
+    }
 
     res.json({
       server: {
@@ -2438,7 +2516,10 @@ serversRouter.get('/invite/:code', async (req, res) => {
         description: server.description,
         iconUrl: server.icon_url,
         bannerUrl: server.banner_url,
-        memberCount: (memberCount as any[])[0].count,
+        ownerId: server.owner_id,
+        memberCount,
+        onlineCount,
+        isFull: memberCount >= (server.max_members || 100),
       },
       invite: {
         code: invite.code,
@@ -2448,6 +2529,10 @@ serversRouter.get('/invite/:code', async (req, res) => {
         expiresAt: invite.expires_at || null,
         isPermanent: !!invite.is_permanent,
       },
+      inviter: inviter
+        ? { id: inviter.id, username: inviter.username, displayName: inviter.display_name || inviter.username, avatarUrl: inviter.avatar_url || null }
+        : null,
+      viewer,
     });
   } catch (error) {
     logger.error('Erreur résolution invitation:', error);
