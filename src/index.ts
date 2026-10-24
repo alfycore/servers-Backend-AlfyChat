@@ -814,6 +814,8 @@ serversRouter.get('/:serverId', authMiddleware, requireMember, async (req, res) 
       ownerId: server.owner_id,
       isP2P: Boolean(server.is_p2p),
       isPublic: Boolean(server.is_public),
+      isCertified: Boolean(server.is_certified),
+      isPartnered: Boolean(server.is_partnered),
       hostingType: server.hosting_type || 'platform',
       category: server.category || 'standard',
       maxMembers: server.max_members || 100,
@@ -3187,11 +3189,26 @@ serversRouter.get('/admin/all', authMiddleware, adminMiddleware, async (req, res
     const [rows] = await db.query<RowDataPacket[]>(
       `SELECT s.id, s.name, s.description, s.icon_url, s.is_certified, s.is_partnered,
               (SELECT COUNT(*) FROM server_members sm WHERE sm.server_id = s.id) as member_count,
-              (SELECT status FROM server_applications sa WHERE sa.server_id = s.id ORDER BY sa.created_at DESC LIMIT 1) as discovery_status
+              (SELECT status FROM server_applications sa WHERE sa.server_id = s.id ORDER BY sa.created_at DESC LIMIT 1) as discovery_status,
+              EXISTS(SELECT 1 FROM server_applications sa WHERE sa.server_id = s.id AND sa.status = 'approved') as is_featured
        FROM servers s
        ORDER BY s.name ASC`
     );
-    res.json({ servers: rows });
+    // camelCase : la page admin lisait isCertified/iconUrl/memberCount sur des
+    // lignes brutes en snake_case — les interrupteurs revenaient à « off » au rechargement.
+    res.json({
+      servers: (rows as any[]).map((r) => ({
+        id: r.id,
+        name: r.name,
+        description: r.description,
+        iconUrl: r.icon_url,
+        memberCount: Number(r.member_count ?? 0),
+        isCertified: Boolean(r.is_certified),
+        isPartnered: Boolean(r.is_partnered),
+        isFeatured: Boolean(r.is_featured),
+        discoveryStatus: r.discovery_status ?? null,
+      })),
+    });
   } catch (error) {
     logger.error('Erreur admin all servers:', error);
     res.status(500).json({ error: 'Erreur serveur' });
@@ -3231,12 +3248,10 @@ serversRouter.delete('/admin/feature/:serverId', authMiddleware, adminMiddleware
   try {
     const { serverId } = req.params;
     const db = getDb();
+    // Les badges certifié/partenaire sont indépendants de la découverte : les
+    // remettre à zéro ici faisait disparaître deux interrupteurs en plus du troisième.
     await db.execute(
       "DELETE FROM server_applications WHERE server_id = ? AND status = 'approved'",
-      [serverId]
-    );
-    await db.execute(
-      "UPDATE servers SET is_certified = 0, is_partnered = 0 WHERE id = ?",
       [serverId]
     );
     res.json({ success: true });
@@ -3302,8 +3317,8 @@ serversRouter.post('/discover/apply', async (req, res) => {
   }
 });
 
-// Admin: lister les candidatures
-serversRouter.get('/discover/applications', async (req, res) => {
+// Admin: lister les candidatures (contenait raisons et demandeurs : réservé aux admins)
+serversRouter.get('/discover/applications', authMiddleware, adminMiddleware, async (req, res) => {
   try {
     const status = req.query.status || 'pending';
     const db = getDb();
@@ -3358,7 +3373,10 @@ serversRouter.patch('/badges/:serverId', authMiddleware, adminMiddleware, async 
     if (isPartnered !== undefined) { updates.push('is_partnered = ?'); params.push(isPartnered ? 1 : 0); }
     if (updates.length === 0) return res.status(400).json({ error: 'Rien à modifier' });
     params.push(serverId);
-    await db.execute(`UPDATE servers SET ${updates.join(', ')} WHERE id = ?`, params);
+    const result = await db.execute(`UPDATE servers SET ${updates.join(', ')} WHERE id = ?`, params);
+    if (result.affectedRows === 0) {
+      return res.status(404).json({ error: 'Serveur introuvable' });
+    }
     res.json({ success: true });
   } catch (error) {
     logger.error('Erreur badges update:', error);
