@@ -2,8 +2,7 @@
 
 Microservice de gestion des serveurs communautaires pour AlfyChat.
 
-![Node.js](https://img.shields.io/badge/Bun-1.2-black?logo=bun)
-![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?logo=typescript)
+![Go](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go)
 ![License](https://img.shields.io/badge/License-Source_Available-blue)
 
 ## Rôle
@@ -14,9 +13,8 @@ Ce service gère la création, la configuration et l'administration des serveurs
 
 | Catégorie | Technologies |
 |-----------|-------------|
-| Runtime | Bun |
-| Langage | TypeScript |
-| API | Express |
+| Langage | Go 1.26 |
+| API | net/http (stdlib) |
 | Auth | JWT |
 | Cache | Redis |
 | Base de données | MySQL 8 |
@@ -38,7 +36,7 @@ Frontend (:4000)  →  Gateway (:3000)  →  Microservices
 
 ### Prérequis
 
-- [Bun](https://bun.sh/) ≥ 1.2
+- [Go](https://go.dev/) ≥ 1.26
 - MySQL 8
 - Redis 7
 
@@ -56,23 +54,23 @@ JWT_SECRET=
 SERVICE_REGISTRY_URL=http://gateway:3000
 ```
 
-### Installation
-
-```bash
-bun install
-```
-
 ### Développement
 
 ```bash
-bun run dev
+go run .
 ```
 
 ### Build production
 
 ```bash
-bun run build
-bun run start
+go build -o bin/service .
+./bin/service
+```
+
+### Tests
+
+```bash
+go test ./...
 ```
 
 ### Docker
@@ -84,17 +82,10 @@ docker compose up servers
 ## Structure du projet
 
 ```
-src/
-├── database.ts          # Connexion MySQL
-├── redis.ts             # Connexion Redis
-├── index.ts             # Point d'entrée
-├── controllers/         # Logique métier (serveurs, canaux, membres, rôles)
-├── routes/              # Définition des routes Express
-├── services/            # Services métier
-├── middleware/          # Auth JWT, rate limiting
-├── types/               # Types TypeScript
-└── utils/               # Utilitaires
-uploads/                 # Icônes et bannières serveur
+main.go                  # Point d'entrée
+internal/
+  platform/                # Socle commun (routeur, validation, auth, MySQL, Redis)
+  servers/                 # Routes, permissions (bitmask), schéma, fichiers (images en MySQL), nettoyages
 ```
 
 ## Contribution
