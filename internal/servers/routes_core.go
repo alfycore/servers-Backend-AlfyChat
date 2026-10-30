@@ -10,7 +10,7 @@ import (
 	"github.com/alfychat/servers/internal/platform"
 )
 
-var allChannelTypes = []string{"text", "voice", "announcement", "category", "forum", "stage", "gallery", "poll", "suggestion", "doc", "counting", "vent", "thread", "media", "minigame", "trivia"}
+var allChannelTypes = append([]string{"text", "voice", "announcement", "category", "forum", "stage", "gallery", "poll", "suggestion", "doc", "counting", "vent", "thread", "media", "minigame", "trivia"}, extraChannelTypes...)
 
 const (
 	quotaTotal     = 5
@@ -475,6 +475,16 @@ func posOf(ch platform.Row) float64 {
 	return 0
 }
 
+// slowModeFor : la valeur demandée, sinon le mode lent par défaut du type de salon.
+func slowModeFor(typ, requested any) float64 {
+	if undef(requested) {
+		if d, ok := defaultSlowMode[platform.JSString(typ)]; ok {
+			return d
+		}
+	}
+	return clampInt(requested, 0, 21600)
+}
+
 func (h *handlers) createChannel(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	if errs := platform.Validate(r,
@@ -530,7 +540,7 @@ func (h *handlers) createChannel(w http.ResponseWriter, r *http.Request) {
 	if _, err := h.db.Exec(ctx, `INSERT INTO channels (id, server_id, name, type, position, parent_id, topic, is_nsfw, slow_mode, user_limit)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		channelID, serverID, platform.SQLParam(name), platform.SQLParam(typ), position, platform.SQLParam(resolved), topicArg,
-		platform.SQLParam(platform.Truthy(field(r, "isNsfw"))), clampInt(field(r, "slowMode"), 0, 21600), clampInt(field(r, "userLimit"), 0, 99)); err != nil {
+		platform.SQLParam(platform.Truthy(field(r, "isNsfw"))), slowModeFor(typ, field(r, "slowMode")), clampInt(field(r, "userLimit"), 0, 99)); err != nil {
 		fail(w, "Erreur création channel:", err)
 		return
 	}

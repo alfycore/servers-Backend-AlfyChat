@@ -12,7 +12,6 @@ import (
 
 const opts = " ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci"
 
-var channelTypes = "'text', 'voice', 'announcement', 'category', 'forum', 'stage', 'gallery', 'poll', 'suggestion', 'doc', 'counting', 'vent', 'thread', 'media', 'minigame', 'trivia'"
 
 var migrations = []string{
 	`CREATE TABLE IF NOT EXISTS servers (
@@ -45,7 +44,7 @@ var migrations = []string{
         id VARCHAR(36) PRIMARY KEY,
         server_id VARCHAR(36) NOT NULL,
         name VARCHAR(100) NOT NULL,
-        type ENUM(` + channelTypes + `) NOT NULL,
+        type VARCHAR(32) NOT NULL,
         parent_id VARCHAR(36),
         position INT DEFAULT 0,
         topic TEXT,
@@ -155,7 +154,10 @@ var migrations = []string{
 	"ALTER TABLE channels ADD COLUMN topic TEXT",
 	"ALTER TABLE channels ADD COLUMN is_nsfw BOOLEAN DEFAULT FALSE",
 	"ALTER TABLE channels ADD COLUMN slow_mode INT DEFAULT 0",
-	"ALTER TABLE channels MODIFY COLUMN type ENUM(" + channelTypes + ") NOT NULL",
+	// Texte libre et non plus ENUM : un ENUM devait être réécrit à chaque nouveau type, et son
+	// MODIFY échouait (silencieusement) dès qu'une ligne portait une valeur hors liste. La liste
+	// des types reste vérifiée par le service (allChannelTypes) et par le gateway.
+	"ALTER TABLE channels MODIFY COLUMN type VARCHAR(32) NOT NULL",
 	"ALTER TABLE server_messages ADD COLUMN is_pinned BOOLEAN DEFAULT FALSE",
 	"ALTER TABLE server_messages ADD COLUMN is_edited BOOLEAN DEFAULT FALSE",
 	"ALTER TABLE server_messages ADD COLUMN is_deleted BOOLEAN DEFAULT FALSE",
@@ -201,6 +203,18 @@ var migrations = []string{
         INDEX idx_server_posts (server_id),
         INDEX idx_author_posts (author_id),
         INDEX idx_last_reply (last_reply_at)
+      )` + opts,
+	`CREATE TABLE IF NOT EXISTS forum_replies (
+        id VARCHAR(36) PRIMARY KEY,
+        post_id VARCHAR(36) NOT NULL,
+        channel_id VARCHAR(36) NOT NULL,
+        server_id VARCHAR(36) NOT NULL,
+        author_id VARCHAR(36) NOT NULL,
+        content TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_reply_post (post_id, created_at),
+        INDEX idx_reply_server (server_id)
       )` + opts,
 	`CREATE TABLE IF NOT EXISTS server_events (
         id VARCHAR(36) PRIMARY KEY,
