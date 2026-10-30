@@ -33,6 +33,9 @@ func Register(srv *platform.Server, db *platform.DB, rdb *redis.Client, auth *pl
 	eventPerm := perm(pManageChannels|pManageEvents, "MANAGE_EVENTS")
 	automodPerm := perm(pAdmin|pManageServer, "MANAGE_SERVER")
 
+	// Import d'un modèle Discord : avant toute route /servers/{serverId}/…
+	route("GET /servers/import/discord", h.previewDiscordImport, a)
+	route("POST /servers/import/discord", h.importDiscordServer, a)
 	route("POST /servers/register", h.register, a)
 	route("POST /servers/{serverId}/ping", h.ping)
 	route("GET /servers", h.listMine, a)
