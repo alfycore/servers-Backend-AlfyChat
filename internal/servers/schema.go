@@ -335,7 +335,8 @@ func Migrate(ctx context.Context, db *platform.DB) error {
 	for _, q := range migrations {
 		if _, err := db.Exec(ctx, q); err != nil {
 			var me *mysql.MySQLError
-			if errors.As(err, &me) && me.Number == 1060 || strings.Contains(err.Error(), "Duplicate column") {
+			// 1060 = colonne déjà présente, 1061 = index déjà présent : migration déjà appliquée.
+			if errors.As(err, &me) && (me.Number == 1060 || me.Number == 1061) || strings.Contains(err.Error(), "Duplicate column") {
 				continue
 			}
 			if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(q)), "ALTER") {
